@@ -101,10 +101,21 @@ bool Keyboard::translate(const Event& ev, KeyEvent& out)
         return true;
     }
 
-    // Ctrl+Space — переключение раскладки, в текст не попадает.
+    // Ctrl+Space — переключение раскладки. В текст не попадает, но событие
+    // отдать обязательно: иначе ни лог, ни индикатор на экране не узнают, что
+    // раскладка сменилась, и пишут старое значение до следующего нажатия.
+    // Это тот же класс ошибки, что был с модификаторами, — молчаливая клавиша.
     if (_ctrl && row == kRowSpace && col == kColSpace) {
         toggleLayout();
-        return false;
+        out.type = KeyEvent::Type::Special;
+        out.special = Special::LayoutToggle;
+        out.utf8[0] = '\0';
+        out.row = row;
+        out.col = col;
+        out.ctrl = _ctrl;
+        out.alt = _alt;
+        out.shift = _shift;
+        return true;
     }
 
     out.ctrl = _ctrl;

@@ -210,6 +210,23 @@ void test_modifiers_are_visible()
     }
 }
 
+/// Спецзначения должны быть уникальны: они передаются номером, и совпадение
+/// двух номеров проявилось бы на устройстве как «нажал одно, сработало другое».
+void test_special_values_are_unique()
+{
+    const keymap::Special all[] = {keymap::Special::None, keymap::Special::Escape, keymap::Special::Tab,
+        keymap::Special::Backspace, keymap::Special::Enter, keymap::Special::Space, keymap::Special::Delete,
+        keymap::Special::Up, keymap::Special::Down, keymap::Special::Left, keymap::Special::Right, keymap::Special::Sym,
+        keymap::Special::Aa, keymap::Special::Ctrl, keymap::Special::Alt, keymap::Special::LayoutToggle};
+
+    const size_t n = sizeof(all) / sizeof(all[0]);
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = i + 1; j < n; ++j) {
+            TEST_ASSERT_NOT_EQUAL(all[i], all[j]);
+        }
+    }
+}
+
 int main(int, char**)
 {
     UNITY_BEGIN();
@@ -237,6 +254,7 @@ int main(int, char**)
 
     RUN_TEST(test_every_position_is_defined);
     RUN_TEST(test_modifiers_are_visible);
+    RUN_TEST(test_special_values_are_unique);
 
     return UNITY_END();
 }

@@ -27,10 +27,12 @@
 
 #include "app_config.h"
 #include "hw/keyboard.h"
+#include "hw/settings_store.h"
 #include "util/format.h"
 #include "version.h"
 
 hw::Keyboard g_keyboard;
+hw::SettingsStore g_settings;
 
 namespace {
 
@@ -80,6 +82,13 @@ bool g_seen[keymap::kRows * keymap::kCols] = {};
 
 /// Покрытие на момент последней отрисовки - чтобы не перерисовывать зря.
 int g_drawn_seen = -1;
+
+/// Раскладка на момент последней отрисовки заголовка.
+///
+/// Счётчик покрытия при Ctrl+Space не меняется, поэтому заголовок с названием
+/// раскладки оставался старым — «ENG» в строке и русская буква в поле ввода.
+/// Отслеживаем раскладку отдельно.
+keymap::Layout g_drawn_layout = keymap::Layout::Latin;
 
 /// Последнее нажатие клавиши.
 char g_last_text[128] = {};
@@ -301,6 +310,8 @@ void drawCoverage()
     char head[96];
     snprintf(head, sizeof(head), "Проверено %d из %d, раскладка %s", done, total, layoutName());
     drawText(head, kMargin, kCoverY, done == total ? TFT_GREEN : TFT_WHITE);
+
+    g_drawn_layout = g_keyboard.layout();
 }
 
 /// Список ненажатых позиций, по несколько строк.
@@ -532,6 +543,12 @@ void setup()
         logLine("SD: НЕ смонтирована");
     }
 
+    // --- Настройки ----------------------------------------------------------
+    // Секреты читаются из NVS в любом случае, файл — только если SD доступна.
+    const bool settings_ok = g_settings.begin();
+    logLine("Настройки: %s, модель %s, таймзона %s", settings_ok ? "из файла" : "по умолчанию",
+        g_settings.config().api_model, g_settings.config().timezone);
+
     // --- Клавиатура ---------------------------------------------------------
     const bool kbd_ok = g_keyboard.begin();
     if (kbd_ok) {
@@ -580,6 +597,21 @@ void loop()
 
         if (ev.row >= keymap::kRows || ev.col >= keymap::kCols) continue;
 
+        // Переключение раскладки: позицию помечаем (клавиша нажата), но в
+        // «последнее нажатие» пишем спецклавишу, а не мнимый символ.
+        if (ev.special == keymap::Special::LayoutToggle) {
+            g_seen[ev.row * keymap::kCols + ev.col] = true;
+            drawCell(ev.row, ev.col, true);
+            snprintf(g_last_text, sizeof(g_last_text), "Последняя: раскладка → %s", layoutName());
+            // Метку пишем после переключения: драйвер уже сменил раскладку,
+            // поэтому здесь верное значение, а не прежнее. Позицию указываем,
+            // чтобы check_keylog.py засчитал клавишу как нажатую — это
+            // Ctrl+Space, то есть физически Space.
+            logLine("r%u c%u → Ctrl+Space, раскладка %s", ev.row, ev.col, layoutName());
+            last_changed = true;
+            continue;
+        }
+
         g_seen[ev.row * keymap::kCols + ev.col] = true;
         drawCell(ev.row, ev.col, true);
 
@@ -602,8 +634,10 @@ void loop()
     // Подсветка зажатых клавиш: точечно, только изменившиеся ячейки.
     updateGrid();
 
-    // Покрытие и список ненажатых меняются редко - перерисовываем по факту.
-    if (seenCount() != g_drawn_seen) {
+    // Покрытие, раскладка и список ненажатых меняются редко - по факту.
+    // Раскладку сравниваем отдельно: Ctrl+Space не меняет счётчик, но меняет
+    // заголовок, и раньше он оставался с прежним «ENG».
+    if (seenCount() != g_drawn_seen || g_keyboard.layout() != g_drawn_layout) {
         drawCoverage();
         drawMissed();
     }

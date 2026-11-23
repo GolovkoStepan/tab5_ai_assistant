@@ -32,10 +32,13 @@ fail() { printf '\033[31m✗\033[0m %s\n' "$*" >&2; }
 step() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 
 # --- Список файлов ----------------------------------------------------------
-# git ls-files возвращает пусто до первого коммита — тогда берём find.
+# Берём и отслеживаемые, и новые файлы: git ls-files без --others молча
+# пропускает то, что ещё не добавлено в индекс, поэтому новый исходник мог
+# не проверяться ни форматтером, ни cppcheck ни в одной локальной проверке.
+# В CI он всплывал бы только после пуша.
 collect_cpp_files() {
     local files
-    files=$(git ls-files '*.cpp' '*.h' '*.hpp' 2>/dev/null || true)
+    files=$(git ls-files --cached --others --exclude-standard '*.cpp' '*.h' '*.hpp' 2>/dev/null || true)
     if [ -z "$files" ]; then
         files=$(find include src test -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) 2>/dev/null || true)
     fi

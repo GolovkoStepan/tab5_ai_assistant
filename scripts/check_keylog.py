@@ -59,51 +59,76 @@ SPECIAL_NAMES = {
 
 CHAR_RE = re.compile(r'r(\d+) c(\d+) → "(.*?)"')
 SPEC_RE = re.compile(r'r(\d+) c(\d+) → спец #(\d+)')
-LAYOUT_RE = re.compile(r'\[(ENG|РУС)\]')
+# Переключение раскладки пишется отдельной строкой: у него нет ни символа,
+# ни спецклавиши из таблицы, но позиция (Ctrl+Space) существует и нажималась.
+TOGGLE_RE = re.compile(r'r(\d+) c(\d+) → Ctrl\+Space, раскладка (ENG|РУС)')
 
 
 def main(path):
     raw = open(path, 'rb').read().decode('utf-8', errors='replace')
+
+    # Разбор идёт по ходу лога, а не по «раскладке в конце»: за один перебор
+    # раскладку переключают несколько раз, а Shift (Aa) меняет регистр. Раньше
+    # сравнение шло с последней раскладкой и без учёта Shift, из-за чего
+    # правильное «Ф» после нажатия Aa считалось расхождением с «ф».
+    #
     # В логе видны управляющие символы (Esc, BS, Tab) - они ломают строки,
     # но сами события всё равно разбираются по префиксу "rN cM".
-    events = []
+    events = []      # (row, col, что получено, раскладка на момент, shift на момент)
+    layout = 'ENG'
+    shift = False
 
     for line in raw.splitlines():
-        m = CHAR_RE.search(line)
+        m = TOGGLE_RE.search(line)
         if m:
-            events.append((int(m.group(1)), int(m.group(2)), m.group(3), line))
+            layout = m.group(3)  # раскладка ПОСЛЕ переключения
+            events.append((int(m.group(1)), int(m.group(2)), 'SPACE', layout, shift))
             continue
+
         m = SPEC_RE.search(line)
         if m:
             row, col, num = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            events.append((row, col, SPECIAL_NAMES.get(num, f'#{num}'), line))
+            name = SPECIAL_NAMES.get(num, f'#{num}')
+            # Aa - защёлка регистра: следующее нажатие даст заглавную.
+            if name == 'AA':
+                shift = not shift
+            events.append((row, col, name, layout, shift))
+            continue
+
+        m = CHAR_RE.search(line)
+        if m:
+            events.append((int(m.group(1)), int(m.group(2)), m.group(3), layout, ' Shift' in line))
 
     if not events:
         print('Событий не найдено. Лог пуст или плата не перезагрузилась.')
         return 1
 
-    # Определяем раскладку по самой поздней записи о смене.
-    layout = 'ENG'
-    for m in LAYOUT_RE.finditer(raw):
-        layout = m.group(1)
-
-    expected = RUSSIAN if layout == 'РУС' else LATIN
-
     print(f'Событий: {len(events)}, раскладка в конце лога: {layout}\n')
 
     seen = OrderedDict()
-    for row, col, got, _ in events:
+    for row, col, got, _, _ in events:
         seen[(row, col)] = got
 
     print(f'Уникальных позиций: {len(seen)} из 70\n')
 
+    # Сверяем каждое событие с той таблицей и тем регистром, что были в момент
+    # нажатия. Сравнение с «раскладкой в конце лога» давало ложные расхождения:
+    # за перебор раскладку переключают несколько раз.
     mismatches = []
-    for pos, got in seen.items():
-        want = expected.get(pos)
-        if want is None:
-            mismatches.append((pos, got, 'позиции нет в таблице'))
-        elif got != want:
-            mismatches.append((pos, got, want))
+    for row, col, got, ev_layout, ev_shift in events:
+        if got in SPECIAL_NAMES.values():
+            continue  # спецклавиша: сверяется по имени, регистр не при чём
+        table = RUSSIAN if ev_layout == 'РУС' else LATIN
+        base = table.get((row, col))
+        if base is None:
+            mismatches.append(((row, col), got, 'позиции нет в таблице'))
+            continue
+        if len(base) == 1 and base.isalpha():
+            want = base.upper() if ev_shift else base
+        else:
+            want = base  # символ: Shift на него не влияет в нашей таблице
+        if got != want:
+            mismatches.append(((row, col), got, want))
 
     if mismatches:
         print('РАСХОЖДЕНИЯ:')

@@ -7,12 +7,18 @@
 
 namespace cfg {
 
-/// Пути на SD-карте. Все имена файлов — ASCII-слаги, заголовки хранятся
+/// Пути внутри SD-карты. Все имена файлов — ASCII-слаги, заголовки хранятся
 /// во фронтматтере внутри файла (см. docs/ARCHITECTURE.md).
+///
+/// Внимание: путь указан **относительно точки монтирования**, без префикса.
+/// `SD_MMC.begin("/sdcard")` монтирует файловую систему в `/sdcard`, поэтому
+/// `SD_MMC.open("/config.json")` открывает `/sdcard/config.json`. Если написать
+/// полный путь, получится `/sdcard/sdcard/...` и fopen упадёт — проверено на
+/// живой плате.
 constexpr const char* kMountPoint = "/sdcard";
-constexpr const char* kNotesDir = "/sdcard/notes";
-constexpr const char* kChatsDir = "/sdcard/chats";
-constexpr const char* kConfigPath = "/sdcard/config.json";
+constexpr const char* kNotesDir = "/notes";
+constexpr const char* kChatsDir = "/chats";
+constexpr const char* kConfigPath = "/config.json";
 
 /// Железо: клавиатура A164 — отдельная I2C-шина, не пересекается с G31/G32.
 constexpr int8_t kKeyboardSda = 0;
