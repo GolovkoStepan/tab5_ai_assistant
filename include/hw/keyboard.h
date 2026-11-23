@@ -21,8 +21,8 @@ namespace hw {
 /// Одно логическое событие клавиатуры.
 struct KeyEvent {
     enum class Type : uint8_t {
-        Char,      ///< печатный символ в поле utf8
-        Special,   ///< управляющая клавиша в поле special
+        Char,     ///< печатный символ в поле utf8
+        Special,  ///< управляющая клавиша в поле special
     };
 
     Type type{Type::Special};

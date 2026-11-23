@@ -25,6 +25,13 @@ constexpr int kBatteryWarnPercent = 20;
 constexpr int kBatteryCriticalPercent = 10;
 constexpr int kBatteryShutdownPercent = 5;
 
+/// Порог «аккумулятор физически подключён», милливольты.
+/// Измерено на плате: без аккумулятора INA226 показывает ~4.34 В (питание USB),
+/// с заряженным — 8.06 В. Порог между ними; намеренно ниже 6.0 В (точка
+/// отсечки платы), чтобы разряженный, но живой аккумулятор не считался
+/// отсутствующим.
+constexpr int kBatteryPresentMillivolts = 5000;
+
 /// Ограничения агентского цикла.
 constexpr int kMaxAgentSteps = 8;
 constexpr size_t kMaxToolResultBytes = 4096;

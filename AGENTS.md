@@ -58,11 +58,14 @@ pio device monitor -b 115200
 # Юнит-тесты логики на хосте (без железа)
 pio test -e native
 
-# Форматирование
-clang-format -i $(git ls-files '*.cpp' '*.h' '*.hpp')
+# ВСЕ проверки CI локально (формат, cppcheck, тесты, сборка)
+./scripts/check.sh
 
-# Проверка стиля без изменений
-clang-format --dry-run --Werror $(git ls-files '*.cpp' '*.h' '*.hpp')
+# То же в контейнере ubuntu:24.04 — максимально близко к CI
+./scripts/check.sh docker
+
+# Только форматирование (нужная версия ставится автоматически)
+./scripts/check.sh format
 
 # Дамп заводской прошивки (ДО первой своей прошивки)
 ~/.platformio/packages/tool-esptool/esptool --chip esp32p4 -p /dev/cu.usbmodem* \
@@ -70,6 +73,12 @@ clang-format --dry-run --Werror $(git ls-files '*.cpp' '*.h' '*.hpp')
 ```
 
 Порт на этой машине: `/dev/cu.usbmodem1101` (может меняться).
+
+> **Про clang-format.** Не вызывай голый `clang-format` из системы: на macOS это
+> Apple clang-format 21.0.0, в Ubuntu 24.04 — 18.1.3, и они по-разному
+> расставляют отступы у trailing-комментариев. CI падал именно из-за этого.
+> `scripts/check.sh` ставит зафиксированную версию (21.1.8) через pip — она
+> одинакова на любой ОС.
 
 ## Правила работы над проектом
 
@@ -80,7 +89,7 @@ clang-format --dry-run --Werror $(git ls-files '*.cpp' '*.h' '*.hpp')
 - **CHANGELOG.** Ведётся по Keep a Changelog, на русском. Запись добавляется в том
   же коммите, что и изменение.
 - **Перед коммитом:** сверить документацию с реализацией, дополнить при расхождении,
-  прогнать `pio run -e tab5`, `pio test -e native`, `clang-format --dry-run --Werror`.
+  прогнать `./scripts/check.sh` (это ровно то, что делает CI).
 - **Библиотеки.** Максимально используем готовые библиотеки M5Stack; своя
   реализация — только там, где готовой нет (клавиатурный слой, UI, агент).
 - **Секреты** (Wi-Fi, API-ключи) — только в NVS на устройстве, никогда в git.

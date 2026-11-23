@@ -126,38 +126,43 @@ void test_sym_does_not_touch_letters()
 
 // --- UTF-8 ---
 
+// Контракт char_utf8(): возвращает число записанных байт БЕЗ завершающего
+// нуля. Поэтому буфер обнуляем сами — иначе TEST_ASSERT_EQUAL_STRING читает
+// неинициализированную память и тест может «пройти» случайно.
+
 void test_utf8_ascii()
 {
-    char buf[8];
+    char buf[8] = {};
     TEST_ASSERT_EQUAL_UINT(1, keymap::char_utf8(2, 1, Layout::Latin, false, false, buf, sizeof(buf)));
     TEST_ASSERT_EQUAL_STRING("q", buf);
 }
 
 void test_utf8_cyrillic_two_bytes()
 {
-    char buf[8];
+    char buf[8] = {};
     TEST_ASSERT_EQUAL_UINT(2, keymap::char_utf8(2, 1, Layout::Russian, false, false, buf, sizeof(buf)));
-    buf[2] = '\0';
     TEST_ASSERT_EQUAL_STRING("й", buf);
 }
 
-void test_utf8_yo_three_bytes()
+void test_utf8_yo_two_bytes()
 {
-    char buf[8];
+    // «Ё» = U+0401 = D0 81: два байта, а не три. Название теста раньше врало.
+    char buf[8] = {};
     TEST_ASSERT_EQUAL_UINT(2, keymap::char_utf8(1, 0, Layout::Russian, true, false, buf, sizeof(buf)));
-    buf[2] = '\0';
     TEST_ASSERT_EQUAL_STRING("Ё", buf);
+    TEST_ASSERT_EQUAL_UINT8(0xD0, static_cast<uint8_t>(buf[0]));
+    TEST_ASSERT_EQUAL_UINT8(0x81, static_cast<uint8_t>(buf[1]));
 }
 
 void test_utf8_no_room()
 {
-    char buf[1];
+    char buf[1] = {};
     TEST_ASSERT_EQUAL_UINT(0, keymap::char_utf8(2, 1, Layout::Russian, false, false, buf, sizeof(buf)));
 }
 
 void test_utf8_special_gives_zero()
 {
-    char buf[8];
+    char buf[8] = {};
     TEST_ASSERT_EQUAL_UINT(0, keymap::char_utf8(3, 13, Layout::Latin, false, false, buf, sizeof(buf)));
 }
 
@@ -182,7 +187,7 @@ int main(int, char**)
 
     RUN_TEST(test_utf8_ascii);
     RUN_TEST(test_utf8_cyrillic_two_bytes);
-    RUN_TEST(test_utf8_yo_three_bytes);
+    RUN_TEST(test_utf8_yo_two_bytes);
     RUN_TEST(test_utf8_no_room);
     RUN_TEST(test_utf8_special_gives_zero);
 

@@ -13,10 +13,10 @@
 namespace hw {
 namespace {
 
+using keymap::Special;
 using m5::unit::tab5_keyboard::Event;
 using m5::unit::tab5_keyboard::EventType;
 using m5::unit::tab5_keyboard::Mode;
-using keymap::Special;
 
 /// Позиции модификаторов в матрице (см. util/keymap.cpp).
 constexpr uint8_t kRowSym = 3, kColSym = 0;

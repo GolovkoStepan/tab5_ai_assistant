@@ -12,8 +12,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Версии инструментов проверки зафиксированы здесь и в scripts/check.sh,
+# чтобы локальный прогон и CI давали одинаковый результат.
 env:
   PLATFORMIO_CORE_DIR: ~/.platformio
+  CLANG_FORMAT_VERSION: 21.1.8
+  PYTHON_VERSION: '3.12'
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -25,17 +29,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # clang-format ставим через pip, а не из apt: версия в репозиториях
+      # Ubuntu зависит от релиза (в 24.04 это 18.1.3) и расходится с той, что
+      # у разработчика. pip даёт одну и ту же версию на любой ОС.
       - name: Установить clang-format
-        run: sudo apt-get update && sudo apt-get install -y clang-format cppcheck
+        run: pip install "clang-format==${CLANG_FORMAT_VERSION}"
 
       - name: Проверка форматирования
         run: |
           files=$(git ls-files '*.cpp' '*.h' '*.hpp')
-          if [ -n "$files" ]; then
-            clang-format --dry-run --Werror $files
-          else
+          if [ -z "$files" ]; then
             echo "Нет файлов C++ — пропускаем"
+            exit 0
           fi
+          clang-format --version
+          clang-format --dry-run --Werror $files
+
+      - name: Установить cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
 
       - name: cppcheck
         run: |
@@ -44,8 +55,6 @@ jobs:
                    --inline-suppr \
                    --suppress=missingIncludeSystem \
                    -I include src/ 2>&1 | tee cppcheck.log
-          # Ошибки уровня error валят сборку; предупреждения — только в лог
-          ! grep -q "error:" cppcheck.log
 
   # ---------------------------------------------------------------------------
   # Юнит-тесты логики на хосте — без железа и без тулчейна.
@@ -55,6 +64,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - uses: actions/cache@v4
         with:
@@ -75,6 +88,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       # Кеш ключуется версией платформы из platformio.ini: при обновлении
       # платформы кеш инвалидируется сам.

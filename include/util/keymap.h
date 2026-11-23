@@ -55,8 +55,7 @@ char32_t codepoint(uint8_t row, uint8_t col, Layout layout, bool shift, bool sym
 
 /// То же, но результат кодируется в UTF-8.
 /// @return число записанных байт без завершающего нуля (0 — нет символа)
-size_t char_utf8(uint8_t row, uint8_t col, Layout layout, bool shift, bool sym, char* out,
-                 size_t out_len);
+size_t char_utf8(uint8_t row, uint8_t col, Layout layout, bool shift, bool sym, char* out, size_t out_len);
 
 /// Кодирует кодовую точку в UTF-8. Используется и в раскладке, и в UI.
 /// @return число байт (1..4), 0 если код некорректен или буфер мал

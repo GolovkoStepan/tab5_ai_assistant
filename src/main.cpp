@@ -63,11 +63,11 @@ void checkPower()
     const int current = M5.Power.getBatteryCurrent();
 
     // Наличие батареи — эвристика: отдельного getBatteryPresence() у M5Unified нет.
-    // Отсечка разряда у платы 6.0 В, ниже аккумулятор уходит в защиту.
-    const bool has_battery = millivolts > 6000;
+    // Измерено на этой плате: без аккумулятора INA226 показывает 4.34 В (USB),
+    // с заряженным — 8.06 В. Порог лежит между ними с большим запасом.
+    const bool has_battery = millivolts > cfg::kBatteryPresentMillivolts;
 
-    report("Батарея: %s %.2f В, %d %%, %d мА", has_battery ? "есть," : "НЕТ,", millivolts / 1000.0f,
-           level, current);
+    report("Батарея: %s %.2f В, %d %%, %d мА", has_battery ? "есть," : "НЕТ,", millivolts / 1000.0f, level, current);
     report("Зарядка: %s", M5.Power.isCharging() ? "идёт" : "нет");
 }
 
@@ -159,12 +159,11 @@ void setup()
     M5.Display.setFont(kUiFont);
     M5.Display.drawString("Съешь же ещё этих мягких булок — «Ёж» №5…", kLeft, 52);
 
-    report("Экран: %dx%d, поворот %d", M5.Display.width(), M5.Display.height(),
-           M5.Display.getRotation());
+    report("Экран: %dx%d, поворот %d", M5.Display.width(), M5.Display.height(), M5.Display.getRotation());
     report("PSRAM: %u КБ, flash: %u МБ", (unsigned)(ESP.getPsramSize() / 1024),
-           (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)));
+        (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)));
     report("Свободно: heap %u КБ, PSRAM %u КБ", (unsigned)(ESP.getFreeHeap() / 1024),
-           (unsigned)(ESP.getFreePsram() / 1024));
+        (unsigned)(ESP.getFreePsram() / 1024));
     report("CPU: %u МГц", (unsigned)getCpuFrequencyMhz());
 
     checkPower();
@@ -180,8 +179,7 @@ void setup()
 
     M5.Display.drawFastHLine(kLeft, kTypingTop - 12, M5.Display.width() - 2 * kLeft, TFT_DARKGRAY);
     M5.Display.setFont(kUiFont);
-    M5.Display.drawString("Печатайте — Ctrl+Space меняет раскладку, Ctrl+L очищает.", kLeft,
-                          kTypingTop - 34);
+    M5.Display.drawString("Печатайте — Ctrl+Space меняет раскладку, Ctrl+L очищает.", kLeft, kTypingTop - 34);
 }
 
 void loop()
@@ -215,7 +213,8 @@ void loop()
             if (typed_len > 0) {
                 // Отступаем на один UTF-8 символ назад.
                 --typed_len;
-                while (typed_len > 0 && (typed[typed_len] & 0xC0) == 0x80) --typed_len;
+                while (typed_len > 0 && (typed[typed_len] & 0xC0) == 0x80)
+                    --typed_len;
                 typed[typed_len] = '\0';
             }
             dirty = true;
@@ -251,9 +250,8 @@ void loop()
         shown_layout = g_keyboard.layout();
         M5.Display.fillRect(M5.Display.width() - 200, kTypingTop - 40, 190, 24, TFT_BLACK);
         M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
-        M5.Display.drawString(shown_layout == keymap::Layout::Russian ? "раскладка: РУС"
-                                                                     : "раскладка: ENG",
-                              M5.Display.width() - 200, kTypingTop - 40);
+        M5.Display.drawString(shown_layout == keymap::Layout::Russian ? "раскладка: РУС" : "раскладка: ENG",
+            M5.Display.width() - 200, kTypingTop - 40);
     }
 
     delay(10);
