@@ -1,0 +1,20 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Дампы прошивок и артефакты сборки — в репозиторий не попадают
+backup/
+*.bin
+*.elf
+*.map
+
+# Системный мусор
+.DS_Store
+*.swp
+*~
+
+# Локальные секреты (ключи, пароли Wi-Fi)
+secrets.h
+secrets.ini
+.env

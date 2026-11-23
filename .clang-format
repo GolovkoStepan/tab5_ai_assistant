@@ -1,0 +1,57 @@
+---
+# Стиль C++ для проекта. Основа — стиль M5Unified/M5GFX, чтобы код не выбивался
+# из библиотек, с которыми работаем.
+Language: Cpp
+BasedOnStyle: Google
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+AccessModifierOffset: -4
+
+# Фигурные скобки: функции — с новой строки (как в M5Stack), управляющие
+# конструкции — на той же строке
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterClass: false
+  AfterControlStatement: false
+  AfterEnum: false
+  AfterFunction: true
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeCatch: false
+  BeforeElse: false
+  SplitEmptyFunction: false
+
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: true
+
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+
+# Отступ для переносов
+ContinuationIndentWidth: 4
+AlignAfterOpenBracket: DontAlign
+BinPackArguments: true
+BinPackParameters: true
+
+SpaceBeforeParens: ControlStatements
+SpaceAfterCStyleCast: false
+SpaceInEmptyBlock: false
+
+# Отступы в case-блоках
+IndentCaseLabels: false
+IndentAccessModifiers: false
+
+AlignTrailingComments: true
+ReflowComments: true
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false

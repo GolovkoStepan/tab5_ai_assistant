@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+
+# Отменяем предыдущий прогон для того же ref — экономим минуты CI
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PLATFORMIO_CORE_DIR: ~/.platformio
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Быстрые проверки: не требуют тулчейна RISC-V, идут первыми.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Стиль и статический анализ
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format cppcheck
+
+      - name: Проверка форматирования
+        run: |
+          files=$(git ls-files '*.cpp' '*.h' '*.hpp')
+          if [ -n "$files" ]; then
+            clang-format --dry-run --Werror $files
+          else
+            echo "Нет файлов C++ — пропускаем"
+          fi
+
+      - name: cppcheck
+        run: |
+          cppcheck --enable=warning,performance,portability \
+                   --error-exitcode=1 \
+                   --inline-suppr \
+                   --suppress=missingIncludeSystem \
+                   -I include src/ 2>&1 | tee cppcheck.log
+          # Ошибки уровня error валят сборку; предупреждения — только в лог
+          ! grep -q "error:" cppcheck.log
+
+  # ---------------------------------------------------------------------------
+  # Юнит-тесты логики на хосте — без железа и без тулчейна.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Юнит-тесты (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-native-${{ hashFiles('platformio.ini') }}
+
+      - name: Установить PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Запустить тесты
+        run: pio test -e native
+
+  # ---------------------------------------------------------------------------
+  # Сборка прошивки. Тулчейн RISC-V и ESP-IDF кешируются между прогонами.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Сборка прошивки
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Кеш ключуется версией платформы из platformio.ini: при обновлении
+      # платформы кеш инвалидируется сам.
+      - name: Кеш PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio
+          key: pio-tab5-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-tab5-
+
+      - name: Установить PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Собрать прошивку
+        run: pio run -e tab5
+
+      - name: Показать размер прошивки
+        run: |
+          ls -lh .pio/build/tab5/firmware.bin
+          echo "### Размер прошивки" >> $GITHUB_STEP_SUMMARY
+          du -h .pio/build/tab5/firmware.bin >> $GITHUB_STEP_SUMMARY
+
+      - name: Сохранить артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: .pio/build/tab5/firmware.bin
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Релиз: по тегу v* собираем прошивку и прикладываем к релизу.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Релиз
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Кеш PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio
+          key: pio-tab5-${{ hashFiles('platformio.ini') }}
+
+      - name: Установить PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Собрать прошивку
+        run: pio run -e tab5
+
+      - name: Подготовить файлы релиза
+        run: |
+          mkdir -p release
+          cp .pio/build/tab5/firmware.bin release/tab5-ai-assistant-${{ github.ref_name }}.bin
+          cp .pio/build/tab5/firmware.elf release/tab5-ai-assistant-${{ github.ref_name }}.elf
+          sha256sum release/* > release/SHA256SUMS.txt
+          cat release/SHA256SUMS.txt
+
+      - name: Создать релиз
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          body_path: CHANGELOG.md
