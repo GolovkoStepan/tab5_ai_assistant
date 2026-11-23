@@ -68,22 +68,37 @@ bool Keyboard::translate(const Event& ev, KeyEvent& out)
         return false;
     }
 
-    // Модификаторы сначала обновляем, само нажатие символом не считается.
+    // Модификаторы: сначала обновляем состояние, потом отдаём событие.
+    //
+    // Отдавать событие обязательно, хотя символа у модификатора нет: иначе
+    // потребитель не узнает, что клавиша вообще нажималась. На диагностике
+    // это выглядело как «нажал Sym, Aa, Ctrl, Alt — счётчик не вырос».
+    // Потребитель, которому нужен только текст, проверяет type == Char.
+    keymap::Special modifier = keymap::Special::None;
     if (row == kRowCtrl && col == kColCtrl) {
         _ctrl = true;
-        return false;
-    }
-    if (row == kRowAlt && col == kColAlt) {
+        modifier = keymap::Special::Ctrl;
+    } else if (row == kRowAlt && col == kColAlt) {
         _alt = true;
-        return false;
-    }
-    if (row == kRowAa && col == kColAa) {
-        _shift = !_shift;
-        return false;
-    }
-    if (row == kRowSym && col == kColSym) {
+        modifier = keymap::Special::Alt;
+    } else if (row == kRowAa && col == kColAa) {
+        _shift = !_shift;  // защёлка: Caps Lock, а не «удержание»
+        modifier = keymap::Special::Aa;
+    } else if (row == kRowSym && col == kColSym) {
         _sym = true;
-        return false;
+        modifier = keymap::Special::Sym;
+    }
+
+    if (modifier != keymap::Special::None) {
+        out.type = KeyEvent::Type::Special;
+        out.special = modifier;
+        out.utf8[0] = '\0';
+        out.row = row;
+        out.col = col;
+        out.ctrl = _ctrl;
+        out.alt = _alt;
+        out.shift = _shift;
+        return true;
     }
 
     // Ctrl+Space — переключение раскладки, в текст не попадает.
@@ -95,6 +110,8 @@ bool Keyboard::translate(const Event& ev, KeyEvent& out)
     out.ctrl = _ctrl;
     out.alt = _alt;
     out.shift = _shift;
+    out.row = row;
+    out.col = col;
 
     const Special sp = keymap::special(row, col);
     if (sp != Special::None) {
@@ -116,12 +133,19 @@ bool Keyboard::poll(KeyEvent& out)
 {
     _units.update();
 
-    if (_keyboard.empty()) return false;
+    // В очереди могут лежать события, которые не дают символа: нажатие и
+    // отпускание модификаторов, Ctrl+Space. Если выходить после первого такого
+    // события, остальные ждут следующего вызова poll(), а вызывающий цикл
+    // успевает сделать паузу — при быстрой печати это заметная задержка.
+    // Поэтому дренируем очередь до первого «настоящего» события.
+    while (!_keyboard.empty()) {
+        const Event ev = _keyboard.oldest();
+        _keyboard.discard();
 
-    const Event ev = _keyboard.oldest();
-    _keyboard.discard();
+        if (translate(ev, out)) return true;
+    }
 
-    return translate(ev, out);
+    return false;
 }
 
 void Keyboard::toggleLayout()

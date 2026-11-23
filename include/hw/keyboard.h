@@ -30,6 +30,11 @@ struct KeyEvent {
     /// UTF-8 символ + завершающий ноль. До 4 байт данных.
     char utf8[5]{};
 
+    /// Физическая позиция клавиши в матрице. Нужна диагностике и UI,
+    /// чтобы сопоставить событие с нарисованной клавишей.
+    uint8_t row{0};
+    uint8_t col{0};
+
     bool ctrl{false};
     bool alt{false};
     bool shift{false};
@@ -55,6 +60,9 @@ public:
 
     /// Версия прошивки клавиатуры, прочитанная в begin(). 0 — не прочитана.
     uint8_t firmwareVersion() const { return _firmware_version; }
+
+    /// Физически зажата ли клавиша в позиции (row, col). Для подсветки в UI.
+    bool isPressed(uint8_t row, uint8_t col) const { return _keyboard.isPressed(row, col); }
 
 private:
     /// Обработать событие и, если получился символ/спецклавиша, вернуть true.

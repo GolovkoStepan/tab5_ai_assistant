@@ -21,3 +21,6 @@ backup/
 secrets.h
 secrets.ini
 .env
+
+# Python-кэш (скрипты проверки)
+__pycache__/

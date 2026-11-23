@@ -166,6 +166,50 @@ void test_utf8_special_gives_zero()
     TEST_ASSERT_EQUAL_UINT(0, keymap::char_utf8(3, 13, Layout::Latin, false, false, buf, sizeof(buf)));
 }
 
+// --- Полнота матрицы ---
+
+/// Каждая из 70 позиций должна чем-то быть: спецклавишей или символом.
+///
+/// Тест-инвариант появился после бага на железе: модификаторы (Sym, Aa, Ctrl,
+/// Alt) отдавались драйвером как «событие без символа» и молча терялись, из-за
+/// чего диагностика показывала 66 из 70 нажатых клавиш. Позиция в матрице без
+/// определения - та же ошибка, только в таблице.
+void test_every_position_is_defined()
+{
+    int silent = 0;
+    for (uint8_t row = 0; row < keymap::kRows; ++row) {
+        for (uint8_t col = 0; col < keymap::kCols; ++col) {
+            const bool is_special = keymap::special(row, col) != keymap::Special::None;
+            const bool has_latin = keymap::codepoint(row, col, Layout::Latin, false, false) != 0;
+            const bool has_russian = keymap::codepoint(row, col, Layout::Russian, false, false) != 0;
+            if (!is_special && !has_latin && !has_russian) ++silent;
+        }
+    }
+    TEST_ASSERT_EQUAL_INT(0, silent);
+}
+
+/// Все четыре модификатора должны быть видны как спецклавиши.
+/// Их пропажа в потоке событий - это баг драйвера, а не таблицы.
+void test_modifiers_are_visible()
+{
+    const keymap::Special mods[] = {
+        keymap::Special::Sym, keymap::Special::Aa, keymap::Special::Ctrl, keymap::Special::Alt};
+    for (keymap::Special want : mods) {
+        bool found = false;
+        for (uint8_t row = 0; row < keymap::kRows && !found; ++row) {
+            for (uint8_t col = 0; col < keymap::kCols && !found; ++col) {
+                if (keymap::special(row, col) == want) {
+                    found = true;
+                    // У модификатора не должно быть печатного символа: иначе он
+                    // попадёт в текст вместе с нажатием.
+                    TEST_ASSERT_EQUAL_UINT32(0, keymap::codepoint(row, col, Layout::Latin, false, false));
+                }
+            }
+        }
+        TEST_ASSERT_TRUE(found);
+    }
+}
+
 int main(int, char**)
 {
     UNITY_BEGIN();
@@ -190,6 +234,9 @@ int main(int, char**)
     RUN_TEST(test_utf8_yo_two_bytes);
     RUN_TEST(test_utf8_no_room);
     RUN_TEST(test_utf8_special_gives_zero);
+
+    RUN_TEST(test_every_position_is_defined);
+    RUN_TEST(test_modifiers_are_visible);
 
     return UNITY_END();
 }
