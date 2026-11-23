@@ -44,6 +44,12 @@ public:
     /// Записать ключ API и сохранить в NVS.
     bool set_api_key(const char* key);
 
+    /// Запомнить раскладку в config.json. Вызывается при Ctrl+Space: иначе
+    /// раскладка после перезагрузки сбрасывалась бы в латиницу, хотя
+    /// ARCHITECTURE обещает её сохранение.
+    /// @param err буфер для причины отказа
+    bool set_layout_russian(bool russian, char* err, size_t err_len);
+
     /// Проверить текущий конфиг на корректность (см. settings::validate).
     bool validate(char* err, size_t err_len) const { return settings::validate(_config, err, err_len); }
 

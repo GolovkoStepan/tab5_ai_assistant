@@ -174,7 +174,15 @@ run_docker() {
         return 1
     fi
 
-    docker run --rm -v "$REPO_ROOT":/w -w /w "$DOCKER_IMAGE" bash -c "
+    # DNS контейнера наследуется от Docker Engine и может быть нерабочим
+    # (видели «Could not resolve ports.ubuntu.com» при живом интернете на
+    # хосте: в /etc/resolv.conf контейнера был 8.8.8.8, недоступный из сети
+    # провайдера). Без этого apt-get не находит ни одного пакета, и проверка
+    # падает на инфраструктуре, а не на коде. Задаём DNS явно; при желании
+    # заменить — через переменную окружения CHECK_DOCKER_DNS.
+    local dns="${CHECK_DOCKER_DNS:-8.8.4.4}"
+
+    docker run --rm --dns "$dns" -v "$REPO_ROOT":/w -w /w "$DOCKER_IMAGE" bash -c "
         set -e
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq >/dev/null

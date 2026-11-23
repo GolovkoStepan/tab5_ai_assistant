@@ -21,18 +21,33 @@
 
 #include <M5Unified.h>
 #include <SD_MMC.h>
-#include <WiFi.h>
 #include <stdarg.h>
 #include <string.h>
 
 #include "app_config.h"
 #include "hw/keyboard.h"
 #include "hw/settings_store.h"
+#include "hw/wifi.h"
+#include "ui/draw.h"
+#include "ui/wifi_screen.h"
 #include "util/format.h"
 #include "version.h"
 
 hw::Keyboard g_keyboard;
 hw::SettingsStore g_settings;
+hw::WifiManager g_wifi;
+ui::WifiScreen g_wifi_screen;
+
+/// Какой экран сейчас на дисплее.
+///
+/// Диагностический экран bring-up и экран Wi-Fi живут одновременно: первый
+/// остаётся инструментом проверки железа, второй — первым настоящим экраном
+/// настроек. Переключение по Ctrl+W.
+enum class Screen : uint8_t {
+    Diagnostic,
+    Wifi,
+};
+Screen g_screen = Screen::Diagnostic;
 
 namespace {
 
@@ -476,7 +491,7 @@ void drawAll()
     drawTargets();
     drawTouchText();
 
-    drawText("Ctrl+Space — раскладка · Ctrl+L — сброс покрытия", kMargin, kHintY - 16, TFT_DARKGRAY);
+    drawText("Ctrl+Space — раскладка · Ctrl+L — сброс покрытия · Ctrl+W — Wi-Fi", kMargin, kHintY - 16, TFT_DARKGRAY);
 }
 
 }  // namespace
@@ -557,22 +572,30 @@ void setup()
         logLine("Клавиатура: НЕ отвечает на адресе 0x%02X", cfg::kKeyboardAddr);
     }
 
+    // Настройки, которые видны сразу: яркость и раскладка. Читались они и
+    // раньше, но не применялись — config.json существовал, а экран и
+    // клавиатура жили на значениях по умолчанию. Это как раз то расхождение
+    // документации с кодом, которое находят глазами, а не тестами.
+    M5.Display.setBrightness(g_settings.config().brightness);
+    g_keyboard.setLayout(g_settings.config().layout_russian ? keymap::Layout::Russian : keymap::Layout::Latin);
+    logLine("Яркость %u, раскладка %s", g_settings.config().brightness, layoutName());
+
     // --- Wi-Fi --------------------------------------------------------------
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    delay(100);
-    const int found = WiFi.scanNetworks();
-    if (found >= 0) {
-        logLine("Wi-Fi: OK, сетей найдено %d", found);
-        logLine("MAC Wi-Fi (C6): %s", WiFi.macAddress().c_str());
-        WiFi.scanDelete();
+    // Подключение к сохранённой сети запускаем в фоне: неблокирующий start
+    // и tick() в цикле, иначе первый экран замирал бы до 20 секунд.
+    const bool wifi_ok = g_wifi.begin();
+    if (wifi_ok) {
+        g_wifi.auto_connect(g_settings.secrets());
     } else {
-        logLine("Wi-Fi: ошибка сканирования (%d)", found);
+        logLine("Wi-Fi: радио не поднялось");
     }
 
+    // Экран Wi-Fi привязываем к драйверам здесь: его tick() работает с этого
+    // момента, даже если экран ни разу не открывали.
+    g_wifi_screen.init(g_wifi, g_settings);
     // Компактная строка состояния: подробности остались в Serial.
-    snprintf(g_status, sizeof(g_status), "%s · SD %s%s · Wi-Fi %d · клав %s", power_status, sd_size,
-        sd_ok ? " RW" : " RO", found, kbd_ok ? "v1" : "нет");
+    snprintf(g_status, sizeof(g_status), "%s · SD %s%s · Wi-Fi %s · клав %s", power_status, sd_size,
+        sd_ok ? " RW" : " RO", wifi_ok ? "OK" : "нет", kbd_ok ? "v1" : "нет");
     logLine("Статус: %s", g_status);
 
     drawAll();
@@ -586,6 +609,30 @@ void loop()
     hw::KeyEvent ev;
     bool last_changed = false;
     while (g_keyboard.poll(ev)) {
+        // Ctrl+W — переход между диагностикой и экраном Wi-Fi. Проверяем до
+        // маршрутизации: это общая команда, она работает на любом экране.
+        if (ev.ctrl && ev.type == hw::KeyEvent::Type::Char && strcmp(ev.utf8, "w") == 0) {
+            if (g_screen == Screen::Diagnostic) {
+                g_screen = Screen::Wifi;
+                g_wifi_screen.onEnter();
+            } else {
+                g_wifi_screen.onExit();
+                g_screen = Screen::Diagnostic;
+                drawAll();
+            }
+            continue;
+        }
+
+        // Экран Wi-Fi обрабатывает события сам, включая Esc.
+        if (g_screen == Screen::Wifi) {
+            if (g_wifi_screen.onKey(ev)) {
+                g_wifi_screen.onExit();
+                g_screen = Screen::Diagnostic;
+                drawAll();
+            }
+            continue;
+        }
+
         // Ctrl+L - сбросить покрытие, чтобы пройти заново.
         if (ev.ctrl && ev.type == hw::KeyEvent::Type::Char && strcmp(ev.utf8, "l") == 0) {
             memset(g_seen, 0, sizeof(g_seen));
@@ -608,6 +655,13 @@ void loop()
             // чтобы check_keylog.py засчитал клавишу как нажатую — это
             // Ctrl+Space, то есть физически Space.
             logLine("r%u c%u → Ctrl+Space, раскладка %s", ev.row, ev.col, layoutName());
+            // Раскладку запоминаем в config.json: иначе после перезагрузки она
+            // сбрасывалась бы в латиницу, хотя ARCHITECTURE 4.2 обещает
+            // сохранение.
+            {
+                char err[96];
+                g_settings.set_layout_russian(g_keyboard.layout() == keymap::Layout::Russian, err, sizeof(err));
+            }
             last_changed = true;
             continue;
         }
@@ -631,6 +685,23 @@ void loop()
         last_changed = true;
     }
 
+    // --- Экран Wi-Fi --------------------------------------------------------
+    // tick() вызывается на любом экране: автоподключение к сохранённой сети
+    // начинается ещё в setup(), и если ждать открытия экрана Wi-Fi, оно
+    // никогда не завершится.
+    g_wifi.tick();
+    g_wifi_screen.tick();
+
+    // Касание обрабатывается до выхода: на экране Wi-Fi оно выбирает сеть.
+    const auto& td = M5.Touch.getDetail();
+
+    if (g_screen == Screen::Wifi) {
+        if (td.wasReleased()) g_wifi_screen.onTouch(td.x, td.y);
+        if (g_wifi_screen.dirty()) g_wifi_screen.draw();
+        delay(10);
+        return;
+    }
+
     // Подсветка зажатых клавиш: точечно, только изменившиеся ячейки.
     updateGrid();
 
@@ -644,10 +715,10 @@ void loop()
     if (last_changed) drawLast();
 
     // --- Тач ----------------------------------------------------------------
-    // Крестик рисуется ПОВЕРХ содержимого, а перед этим область под ним
-    // сохраняется в память. При отпускании сохранённое возвращается на место —
-    // никакой полной перерисовки экрана, а значит нет мерцания.
-    const auto& td = M5.Touch.getDetail();
+    // Калибровочная мишень на диагностическом экране. Крестик рисуется ПОВЕРХ
+    // содержимого, а перед этим область под ним сохраняется в память. При
+    // отпускании сохранённое возвращается на место — никакой полной
+    // перерисовки экрана, а значит нет мерцания.
     if (td.wasPressed()) {
         g_has_touch = true;
         updateTouchText(td.x, td.y);

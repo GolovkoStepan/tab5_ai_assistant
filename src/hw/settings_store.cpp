@@ -240,4 +240,14 @@ bool SettingsStore::set_api_key(const char* key)
     return save_to_nvs();
 }
 
+bool SettingsStore::set_layout_russian(bool russian, char* err, size_t err_len)
+{
+    if (_config.layout_russian == russian) return true;
+    _config.layout_russian = russian;
+
+    // Пишем только файл, NVS не трогаем: раскладка — не секрет, а лишняя
+    // запись в NVS изнашивает раздел.
+    return save_to_file(err, err_len);
+}
+
 }  // namespace hw
