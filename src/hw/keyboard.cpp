@@ -41,7 +41,11 @@ bool Keyboard::begin()
     kcfg.irq_pin = cfg::kKeyboardInt;
     kcfg.software_repeat = true;  // удержание стрелок и Backspace
     kcfg.repeat_initial_ms = 400;
-    kcfg.repeat_rate_ms = 60;
+    // 80 мс — значение по умолчанию в библиотеке. Меньше ставить нельзя: кадр
+    // прокрутки ленты на этой плате занимает 55–70 мс (сдвиг готового
+    // изображения в PSRAM плюс дорисовка открывшейся полосы), и при 60 мс
+    // события приходили чаще, чем экран успевал дорисоваться.
+    kcfg.repeat_rate_ms = 80;
     _keyboard.config(kcfg);
 
     if (!_units.add(_keyboard, Wire)) return false;

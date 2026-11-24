@@ -182,7 +182,20 @@ run_docker() {
     # заменить — через переменную окружения CHECK_DOCKER_DNS.
     local dns="${CHECK_DOCKER_DNS:-8.8.4.4}"
 
-    docker run --rm --dns "$dns" -v "$REPO_ROOT":/w -w /w "$DOCKER_IMAGE" bash -c "
+    # Кеш тулчейна и хостовой сборки между прогонами. Без него каждая проверка
+    # качала бы Arduino core, ESP-IDF и RISC-V-компилятор заново — это
+    # несколько гигабайт и около пяти минут только на скачивание.
+    #
+    # Сборка идёт в КОПИИ репозитория, а не в смонтированном каталоге:
+    # .pio/build с хоста содержит объектные файлы macOS (Mach-O), и Linux-линкер
+    # получил бы чужой формат. Копия монтируется как /src только для чтения,
+    # а собирается уже без неё.
+    local pio_cache="tab5-pio-core-${DOCKER_IMAGE//[:.]/-}"
+
+    docker run --rm --dns "$dns" \
+        -v "$REPO_ROOT":/src:ro \
+        -v "$pio_cache":/root/.platformio \
+        -w /work "$DOCKER_IMAGE" bash -c "
         set -e
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq >/dev/null
@@ -193,10 +206,24 @@ run_docker() {
 
         export PATH=/opt/venv/bin:\$PATH
 
+        # Работаем в копии, а не в смонтированном каталоге. Причина — .pio:
+        # в нём лежат объектные файлы macOS (Mach-O), и Linux-линкер получил бы
+        # чужой формат. Копия .pio не содержит, поэтому сборка честная, а
+        # исходники хоста при этом не меняются ни на байт.
+        mkdir -p /work
+        cp -a /src/. /work/
+        cd /work
+        rm -rf .pio
+
         echo '--- clang-format ---'
         clang-format --version
-        files=\$(git ls-files '*.cpp' '*.h' '*.hpp')
+        # Файлы берём вместе с ещё не добавленными в индекс: CI видит только
+        # закоммиченное, и без --others локальный прогон проверял бы 13 файлов
+        # вместо 41 — новые исходники всплывали бы лишь после пуша, то есть
+        # ровно в тот момент, когда исправлять уже поздно.
+        files=\$(git ls-files --cached --others --exclude-standard '*.cpp' '*.h' '*.hpp')
         [ -n \"\$files\" ] || { echo 'нет файлов C++'; exit 1; }
+        echo \"файлов: \$(printf '%s\n' \$files | wc -l)\"
         clang-format --dry-run --Werror \$files
         echo 'форматирование: OK'
 
@@ -207,7 +234,15 @@ run_docker() {
 
         echo '--- тесты ---'
         pio test -e native
+
+        # Сборка прошивки: в CI это отдельный job, и он собирает на Linux.
+        # Раньше docker-режим её пропускал, поэтому «локально зелено» ничего
+        # не говорило о том, соберётся ли прошивка в CI.
+        echo '--- сборка прошивки (env:tab5) ---'
+        pio run -e tab5
+        ls -lh .pio/build/tab5/firmware.bin
     "
+
     ok "все проверки в контейнере прошли"
 }
 

@@ -549,7 +549,10 @@ void WifiScreen::draw_password_field()
     char shown[kMaskTail + 4] = {};
     for (size_t i = 0; i < show; ++i)
         shown[i] = '*';
-    if (chars > kMaskTail) shown[0] = '…';
+
+    // Многоточие — три байта UTF-8, а не один: одиночный байт 0xE2 показался бы
+    // на экране мусорным глифом.
+    if (chars > kMaskTail) memcpy(shown, "…", 3);
 
     ui::text(shown, kMargin + 10, kFieldY + 13, TFT_WHITE);
 

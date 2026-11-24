@@ -250,4 +250,34 @@ bool SettingsStore::set_layout_russian(bool russian, char* err, size_t err_len)
     return save_to_file(err, err_len);
 }
 
+bool SettingsStore::set_api_settings(const settings::Config& cfg, char* err, size_t err_len)
+{
+    if (err && err_len > 0) err[0] = '\0';
+
+    char local_err[128];
+    if (!settings::validate(cfg, local_err, sizeof(local_err))) {
+        if (err && err_len > 0) snprintf(err, err_len, "%s", local_err);
+        return false;
+    }
+
+    // Раскладку и яркость экран настроек API не меняет, а они относятся к
+    // текущему состоянию устройства: берём их из СВОИХ настроек, а не из
+    // черновика экрана. Иначе сохранение адреса вернуло бы яркость к той, что
+    // была при входе в экран.
+    settings::Config next = cfg;
+    next.layout_russian = _config.layout_russian;
+    next.brightness = _config.brightness;
+    next.screen_timeout_min = _config.screen_timeout_min;
+    next.battery_warn_percent = _config.battery_warn_percent;
+    next.battery_critical_percent = _config.battery_critical_percent;
+    next.battery_shutdown_percent = _config.battery_shutdown_percent;
+
+    // Сначала в память — иначе при отказе записи экран показывал бы сохранённое,
+    // а на карте осталось бы старое.
+    _config = next;
+
+    if (!save_to_file(err, err_len)) return false;
+    return true;
+}
+
 }  // namespace hw

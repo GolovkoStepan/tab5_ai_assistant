@@ -161,9 +161,27 @@ jobs:
           sha256sum release/* > release/SHA256SUMS.txt
           cat release/SHA256SUMS.txt
 
+      # Заметки релиза — только раздел своей версии. Раньше в body_path уходил
+      # весь CHANGELOG.md, и в описание релиза попадала история всех прошлых
+      # версий (441 строка вместо десятка): заметки перестают быть заметками.
+      - name: Вырезать раздел CHANGELOG для этой версии
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md > release/notes.md
+
+          if [ ! -s release/notes.md ]; then
+            echo "::warning::Раздел [$version] не найден в CHANGELOG.md — заметки будут пустыми"
+          else
+            echo "--- заметки релиза ---"
+            cat release/notes.md
+          fi
+
       - name: Создать релиз
         uses: softprops/action-gh-release@v2
         with:
-          files: release/*
-          generate_release_notes: true
-          body_path: CHANGELOG.md
+          files: release/tab5-ai-assistant-*
+          body_path: release/notes.md

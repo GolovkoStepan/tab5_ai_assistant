@@ -8,6 +8,9 @@
 
 #include <M5Unified.h>
 
+#include <stdio.h>
+#include <string.h>
+
 namespace ui {
 
 /// Шрифт интерфейса: efontJA (Efont Biwidth), 16 px.
@@ -39,6 +42,21 @@ inline void text(const char* text, int x, int y, uint16_t fg, uint16_t bg = TFT_
     M5.Display.drawString(text, x, y);
 }
 
+/// Рисует строку БЕЗ фона: промежутки между глифами не закрашиваются.
+///
+/// Нужно там, где область уже залита одним цветом. Заливка фона под каждым
+/// глифом стоит почти столько же, сколько сам глиф: на ленте чата это 222 мс
+/// против 125 мс на кадр. Панель TAB5 физически портретная (720×1280), а
+/// рисуем мы в альбомной (1280×720), то есть каждый глиф ещё и поворачивается
+/// программно — экономить здесь есть на чём.
+inline void text_plain(const char* text, int x, int y, uint16_t fg, const lgfx::IFont* f = nullptr)
+{
+    M5.Display.setFont(f ? f : ui::font());
+    M5.Display.setTextDatum(textdatum_t::top_left);
+    M5.Display.setTextColor(fg);
+    M5.Display.drawString(text, x, y);
+}
+
 /// Строка, прижатая к правому краю.
 inline void text_right(const char* text, int right, int y, uint16_t fg, uint16_t bg = TFT_BLACK)
 {
@@ -58,6 +76,48 @@ inline void text_center(const char* text, int center_x, int y, uint16_t fg, uint
     M5.Display.setTextColor(fg, bg);
     M5.Display.drawString(text, center_x, y);
     M5.Display.setTextDatum(textdatum_t::top_left);
+}
+
+/// Обрезать строку по ПИКСЕЛЬНОЙ ширине, а не по числу символов.
+///
+/// Заголовки и имена состоят из кириллицы (2 байта) и латиницы (1 байт), поэтому
+/// символьная оценка врёт в разы: 96 байт — это 96 латинских букв или 48
+/// кириллических. Обрезка идёт по границе UTF-8, иначе M5GFX нарисовал бы
+/// вместо буквы рамку.
+///
+/// @param scratch     буфер для результата (используется, только если режем)
+/// @param scratch_len его размер, не меньше 2
+/// @return исходную строку, если она помещается, иначе — обрезанную с «…»
+inline const char* fit_width(const char* text, int room, char* scratch, size_t scratch_len)
+{
+    if (text == nullptr || room <= 0 || scratch == nullptr || scratch_len < 2) return "";
+
+    // Шрифт ставим явно: мерим тем же, которым будем рисовать.
+    M5.Display.setFont(ui::font());
+
+    if (M5.Display.textWidth(text) <= room) return text;
+
+    const size_t cap = scratch_len - 4;  // место под «…» (3 байта UTF-8)
+    size_t len = strlen(text);
+    if (len > cap) len = cap;
+    memcpy(scratch, text, len);
+    scratch[len] = '\0';
+
+    while (len > 0) {
+        --len;
+        while (len > 0 && (static_cast<unsigned char>(scratch[len]) & 0xC0) == 0x80)
+            --len;
+        scratch[len] = '\0';
+        char probe[192];
+        snprintf(probe, sizeof(probe), "%s…", scratch);
+        if (M5.Display.textWidth(probe) <= room) {
+            snprintf(scratch, scratch_len, "%s", probe);
+            return scratch;
+        }
+    }
+
+    scratch[0] = '\0';
+    return scratch;
 }
 
 }  // namespace ui

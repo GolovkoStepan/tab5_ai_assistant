@@ -50,6 +50,14 @@ public:
     /// @param err буфер для причины отказа
     bool set_layout_russian(bool russian, char* err, size_t err_len);
 
+    /// Заменить настройки API (адрес, модель, температура, уровень
+    /// рассуждений) и сохранить файл.
+    ///
+    /// Берёт из переданного конфига только поля API: яркость, раскладка и
+    /// пороги батареи относятся к текущему состоянию устройства, и экран
+    /// настроек API их не редактирует.
+    bool set_api_settings(const settings::Config& cfg, char* err, size_t err_len);
+
     /// Проверить текущий конфиг на корректность (см. settings::validate).
     bool validate(char* err, size_t err_len) const { return settings::validate(_config, err, err_len); }
 

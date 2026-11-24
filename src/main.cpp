@@ -1,22 +1,14 @@
 /*
  * M5Stack TAB5 AI Assistant — точка входа прошивки.
  *
- * Этап v0.1.0 (bring-up). Задача — проверить на живой плате:
- *   - платформа собирается и стартует;
- *   - дисплей и тач инициализируются, поворот правильный;
- *   - кириллица рисуется без «квадратиков»;
- *   - клавиатура A164 отвечает, все 70 клавиш отдают ожидаемое, раскладка верна;
- *   - тач попадает туда, куда нажали;
- *   - питание читается через INA226;
- *   - SD-карта монтируется;
- *   - Wi-Fi через ESP32-C6 поднимается.
+ * Основной экран — чат: лента сообщений, поле ввода, стриминг ответа модели
+ * через OpenAI-совместимый API (v0.2.0). Треды лежат на SD в JSONL, ключ API —
+ * в NVS.
  *
- * Экран - матрица клавиатуры 5x14. Нажатая клавиша подсвечивается жёлтым, уже
- * проверенная становится зелёной, непроверенная остаётся тёмной. Ниже - счётчик
- * покрытия со списком ненажатых позиций и калибровочные мишени для тача: при
- * касании показывается фактическая координата и отклонение от ближайшей мишени.
- *
- * Экран диагностический и временный: на этапе v0.2.0 его заменит интерфейс чата.
+ * Маршрутизация: Ctrl+W — Wi-Fi, Ctrl+A — настройки API, Ctrl+D — диагностика,
+ * Esc с любого экрана возвращает в чат. Диагностика — наследство этапа v0.1.0
+ * (матрица клавиатуры 5x14, покрытие клавиш, калибровочные мишени тача); она
+ * больше не стартовый экран, но осталась инструментом проверки железа.
  */
 
 #include <M5Unified.h>
@@ -25,10 +17,16 @@
 #include <string.h>
 
 #include "app_config.h"
+#include "hw/api_client.h"
+#include "hw/chat_store.h"
+#include "hw/clock.h"
 #include "hw/keyboard.h"
 #include "hw/settings_store.h"
 #include "hw/wifi.h"
+#include "ui/api_settings_screen.h"
+#include "ui/chat_screen.h"
 #include "ui/draw.h"
+#include "ui/threads_screen.h"
 #include "ui/wifi_screen.h"
 #include "util/format.h"
 #include "version.h"
@@ -36,18 +34,26 @@
 hw::Keyboard g_keyboard;
 hw::SettingsStore g_settings;
 hw::WifiManager g_wifi;
+hw::ApiClient g_api;
+hw::ChatStore g_chat_store;
 ui::WifiScreen g_wifi_screen;
+ui::ChatScreen g_chat_screen;
+ui::ApiSettingsScreen g_api_screen;
+ui::ThreadsScreen g_threads_screen;
 
 /// Какой экран сейчас на дисплее.
 ///
-/// Диагностический экран bring-up и экран Wi-Fi живут одновременно: первый
-/// остаётся инструментом проверки железа, второй — первым настоящим экраном
-/// настроек. Переключение по Ctrl+W.
+/// Диагностический экран bring-up остаётся инструментом проверки железа,
+/// остальные — настоящими экранами. Чат — основной; Ctrl+W и Ctrl+A уводят в
+/// настройки, Esc возвращает в чат.
 enum class Screen : uint8_t {
     Diagnostic,
+    Chat,
+    Threads,
     Wifi,
+    ApiSettings,
 };
-Screen g_screen = Screen::Diagnostic;
+Screen g_screen = Screen::Chat;
 
 namespace {
 
@@ -491,7 +497,74 @@ void drawAll()
     drawTargets();
     drawTouchText();
 
-    drawText("Ctrl+Space — раскладка · Ctrl+L — сброс покрытия · Ctrl+W — Wi-Fi", kMargin, kHintY - 16, TFT_DARKGRAY);
+    drawText("Ctrl+Space — раскладка · Ctrl+L — сброс покрытия · Ctrl+D — чат · Ctrl+W — Wi-Fi · Ctrl+A — API", kMargin,
+        kHintY - 16, TFT_DARKGRAY);
+}
+
+}  // namespace
+
+namespace {
+
+/// Переключить экран. Сначала выгружаем текущий, потом входим в новый: у
+/// каждого экрана есть onExit, и пропустить его значит оставить недописанное
+/// или нестёртый пароль.
+void switch_screen(Screen next)
+{
+    if (g_screen == next) return;
+
+    switch (g_screen) {
+    case Screen::Chat: g_chat_screen.onExit(); break;
+    case Screen::Threads: g_threads_screen.onExit(); break;
+    case Screen::Wifi: g_wifi_screen.onExit(); break;
+    case Screen::ApiSettings: g_api_screen.onExit(); break;
+    case Screen::Diagnostic: break;
+    }
+
+    g_screen = next;
+
+    switch (g_screen) {
+    case Screen::Chat: g_chat_screen.onEnter(); break;
+    case Screen::Threads: g_threads_screen.onEnter(); break;
+    case Screen::Wifi: g_wifi_screen.onEnter(); break;
+    case Screen::ApiSettings: g_api_screen.onEnter(); break;
+    case Screen::Diagnostic: drawAll(); break;
+    }
+}
+
+/// Открыть тред, выбранный в списке, и вернуться в чат.
+///
+/// Требование экрана списка выполняется здесь, а не в самом экране: смена
+/// экрана — работа main, и только он знает, что открытие треда означает ещё и
+/// переход в чат. Если открыть не удалось (идёт ответ, файл не прочитался),
+/// остаёмся в списке и показываем причину там же.
+/// Открытый тред удалили в списке — чат должен это увидеть.
+///
+/// Без этого лента, поле ввода и измерения относились бы к разговору, которого
+/// больше нет на карте, а файл создался бы заново при следующем вопросе.
+void sync_after_thread_delete()
+{
+    if (!g_threads_screen.take_open_removed()) return;
+    g_chat_screen.new_thread();
+}
+
+bool open_thread_from_list()
+{
+    const char* slug = g_threads_screen.take_selected_slug();
+    if (slug == nullptr || slug[0] == '\0') return false;
+
+    // Копия: clear_request() обнулит буфер, а slug нужен и после перехода.
+    char wanted[48];
+    snprintf(wanted, sizeof(wanted), "%s", slug);
+    g_threads_screen.clear_request();
+
+    if (!g_chat_screen.open_thread(wanted)) {
+        g_threads_screen.notice(g_chat_screen.last_error());
+        return true;  // запрос был, но открыть не удалось — причина уже на экране
+    }
+
+    switch_screen(Screen::Chat);
+    g_chat_screen.draw();
+    return true;
 }
 
 }  // namespace
@@ -580,6 +653,11 @@ void setup()
     g_keyboard.setLayout(g_settings.config().layout_russian ? keymap::Layout::Russian : keymap::Layout::Latin);
     logLine("Яркость %u, раскладка %s", g_settings.config().brightness, layoutName());
 
+    // --- Часы ---------------------------------------------------------------
+    // Таймзона нужна до первого треда: по ней чат формирует метки времени в
+    // файле. Синхронизация по NTP пойдёт в loop(), когда поднимется Wi-Fi.
+    hw::clock_sync::begin(g_settings.config());
+
     // --- Wi-Fi --------------------------------------------------------------
     // Подключение к сохранённой сети запускаем в фоне: неблокирующий start
     // и tick() в цикле, иначе первый экран замирал бы до 20 секунд.
@@ -593,12 +671,27 @@ void setup()
     // Экран Wi-Fi привязываем к драйверам здесь: его tick() работает с этого
     // момента, даже если экран ни разу не открывали.
     g_wifi_screen.init(g_wifi, g_settings);
+
+    // --- Чат -----------------------------------------------------------------
+    // Хранилище тредов и экран чата. Каталог /chats создаётся здесь же; без SD
+    // чат работать не сможет, и это видно по логу, а не по «пустому экрану».
+    const bool chats_ok = g_chat_store.begin();
+    if (!chats_ok) logLine("Чат: хранилище тредов недоступно (SD?)");
+
+    g_chat_screen.init(g_api, g_chat_store, g_settings, g_wifi);
+    g_api_screen.init(g_settings, g_wifi);
+    g_threads_screen.init(g_chat_store);
+
     // Компактная строка состояния: подробности остались в Serial.
     snprintf(g_status, sizeof(g_status), "%s · SD %s%s · Wi-Fi %s · клав %s", power_status, sd_size,
         sd_ok ? " RW" : " RO", wifi_ok ? "OK" : "нет", kbd_ok ? "v1" : "нет");
     logLine("Статус: %s", g_status);
 
-    drawAll();
+    // Стартуем в чате: это основной экран устройства. Диагностика осталась
+    // доступной, но по умолчанию не показывается.
+    g_screen = Screen::Chat;
+    g_chat_screen.onEnter();
+    g_chat_screen.draw();  // не drawAll(): он рисует диагностический экран
 }
 
 void loop()
@@ -609,31 +702,90 @@ void loop()
     hw::KeyEvent ev;
     bool last_changed = false;
     while (g_keyboard.poll(ev)) {
-        // Ctrl+W — переход между диагностикой и экраном Wi-Fi. Проверяем до
-        // маршрутизации: это общая команда, она работает на любом экране.
-        if (ev.ctrl && ev.type == hw::KeyEvent::Type::Char && strcmp(ev.utf8, "w") == 0) {
+        // Переключение раскладки обрабатывается на любом экране: драйвер уже
+        // сменил её внутри poll(), а здесь мы её запоминаем. Раньше это делал
+        // только диагностический экран, и из чата раскладка переключалась, но
+        // в config.json не сохранялась — после перезагрузки возвращалась
+        // латиница, хотя выбор пользователя должен жить дольше сеанса.
+        if (ev.special == keymap::Special::LayoutToggle) {
+            char err[96];
+            g_settings.set_layout_russian(g_keyboard.layout() == keymap::Layout::Russian, err, sizeof(err));
+
             if (g_screen == Screen::Diagnostic) {
-                g_screen = Screen::Wifi;
-                g_wifi_screen.onEnter();
-            } else {
-                g_wifi_screen.onExit();
-                g_screen = Screen::Diagnostic;
-                drawAll();
+                g_seen[ev.row * keymap::kCols + ev.col] = true;
+                drawCell(ev.row, ev.col, true);
+                snprintf(g_last_text, sizeof(g_last_text), "Последняя: раскладка → %s", layoutName());
+                // Метку пишем после переключения: драйвер уже сменил раскладку,
+                // поэтому здесь верное значение, а не прежнее. Позицию указываем,
+                // чтобы check_keylog.py засчитал клавишу как нажатую — это
+                // Ctrl+Space, то есть физически Space.
+                logLine("r%u c%u → Ctrl+Space, раскладка %s", ev.row, ev.col, layoutName());
+                last_changed = true;
             }
             continue;
         }
 
-        // Экран Wi-Fi обрабатывает события сам, включая Esc.
+        // Общие команды проверяются до маршрутизации: они работают на любом
+        // экране. Ctrl+W — Wi-Fi, Ctrl+A — настройки API, Ctrl+D — диагностика.
+        if (ev.ctrl && ev.type == hw::KeyEvent::Type::Char) {
+            if (strcmp(ev.utf8, "w") == 0 || strcmp(ev.utf8, "ц") == 0) {
+                switch_screen(g_screen == Screen::Wifi ? Screen::Chat : Screen::Wifi);
+                continue;
+            }
+            if (strcmp(ev.utf8, "a") == 0 || strcmp(ev.utf8, "ф") == 0) {
+                switch_screen(g_screen == Screen::ApiSettings ? Screen::Chat : Screen::ApiSettings);
+                continue;
+            }
+            // Ctrl+T — список тредов. «е» — та же клавиша в ЙЦУКЕН.
+            if (strcmp(ev.utf8, "t") == 0 || strcmp(ev.utf8, "е") == 0) {
+                switch_screen(g_screen == Screen::Threads ? Screen::Chat : Screen::Threads);
+                continue;
+            }
+            if (strcmp(ev.utf8, "d") == 0 || strcmp(ev.utf8, "в") == 0) {
+                switch_screen(g_screen == Screen::Diagnostic ? Screen::Chat : Screen::Diagnostic);
+                continue;
+            }
+        }
+
+        // Экраны со своим состоянием обрабатывают события сами, включая Esc.
+        if (g_screen == Screen::Chat) {
+            if (g_chat_screen.onKey(ev)) switch_screen(Screen::Diagnostic);
+            continue;
+        }
         if (g_screen == Screen::Wifi) {
-            if (g_wifi_screen.onKey(ev)) {
-                g_wifi_screen.onExit();
-                g_screen = Screen::Diagnostic;
-                drawAll();
+            if (g_wifi_screen.onKey(ev)) switch_screen(Screen::Chat);
+            continue;
+        }
+        if (g_screen == Screen::ApiSettings) {
+            if (g_api_screen.onKey(ev)) switch_screen(Screen::Chat);
+            continue;
+        }
+        if (g_screen == Screen::Threads) {
+            // onKey() не закрывает экран сам: Enter и повторный тап оставляют
+            // запрос на открытие треда, а открытие делает main — только он
+            // знает, что за ним следует переход в чат.
+            g_threads_screen.set_chat_busy(g_chat_screen.busy());
+            const bool want_close = g_threads_screen.onKey(ev);
+            sync_after_thread_delete();
+            if (g_threads_screen.take_new_request()) {
+                // Новый тред создаётся только на простое: если ответ ещё идёт,
+                // он писался бы в чужой файл. Сообщаем причину и остаёмся в
+                // списке, а не уводим в чат с пустым результатом.
+                if (g_chat_screen.busy()) {
+                    g_threads_screen.notice("Дождитесь ответа или нажмите Esc");
+                    continue;
+                }
+                g_chat_screen.new_thread();
+                switch_screen(Screen::Chat);
+                g_chat_screen.draw();
+                continue;
             }
+            if (open_thread_from_list()) continue;
+            if (want_close) switch_screen(Screen::Chat);
             continue;
         }
 
-        // Ctrl+L - сбросить покрытие, чтобы пройти заново.
+        // Ctrl+L - сбросить покрытие, чтобы пройти заново (диагностика).
         if (ev.ctrl && ev.type == hw::KeyEvent::Type::Char && strcmp(ev.utf8, "l") == 0) {
             memset(g_seen, 0, sizeof(g_seen));
             drawGrid();
@@ -643,28 +795,6 @@ void loop()
         }
 
         if (ev.row >= keymap::kRows || ev.col >= keymap::kCols) continue;
-
-        // Переключение раскладки: позицию помечаем (клавиша нажата), но в
-        // «последнее нажатие» пишем спецклавишу, а не мнимый символ.
-        if (ev.special == keymap::Special::LayoutToggle) {
-            g_seen[ev.row * keymap::kCols + ev.col] = true;
-            drawCell(ev.row, ev.col, true);
-            snprintf(g_last_text, sizeof(g_last_text), "Последняя: раскладка → %s", layoutName());
-            // Метку пишем после переключения: драйвер уже сменил раскладку,
-            // поэтому здесь верное значение, а не прежнее. Позицию указываем,
-            // чтобы check_keylog.py засчитал клавишу как нажатую — это
-            // Ctrl+Space, то есть физически Space.
-            logLine("r%u c%u → Ctrl+Space, раскладка %s", ev.row, ev.col, layoutName());
-            // Раскладку запоминаем в config.json: иначе после перезагрузки она
-            // сбрасывалась бы в латиницу, хотя ARCHITECTURE 4.2 обещает
-            // сохранение.
-            {
-                char err[96];
-                g_settings.set_layout_russian(g_keyboard.layout() == keymap::Layout::Russian, err, sizeof(err));
-            }
-            last_changed = true;
-            continue;
-        }
 
         g_seen[ev.row * keymap::kCols + ev.col] = true;
         drawCell(ev.row, ev.col, true);
@@ -685,19 +815,44 @@ void loop()
         last_changed = true;
     }
 
-    // --- Экран Wi-Fi --------------------------------------------------------
+    // --- Периодика экранов ---------------------------------------------------
     // tick() вызывается на любом экране: автоподключение к сохранённой сети
-    // начинается ещё в setup(), и если ждать открытия экрана Wi-Fi, оно
-    // никогда не завершится.
+    // начинается ещё в setup(), а запрос к модели не должен замирать при
+    // переключении экрана.
     g_wifi.tick();
     g_wifi_screen.tick();
+    g_chat_screen.tick();
+    g_api_screen.tick();
+    hw::clock_sync::tick(g_wifi.connected());
 
-    // Касание обрабатывается до выхода: на экране Wi-Fi оно выбирает сеть.
     const auto& td = M5.Touch.getDetail();
+
+    if (g_screen == Screen::Chat) {
+        if (td.wasReleased()) g_chat_screen.onTouch(td.x, td.y);
+        if (g_chat_screen.dirty()) g_chat_screen.draw();
+        delay(10);
+        return;
+    }
 
     if (g_screen == Screen::Wifi) {
         if (td.wasReleased()) g_wifi_screen.onTouch(td.x, td.y);
         if (g_wifi_screen.dirty()) g_wifi_screen.draw();
+        delay(10);
+        return;
+    }
+
+    if (g_screen == Screen::ApiSettings) {
+        if (td.wasReleased()) g_api_screen.onTouch(td.x, td.y);
+        if (g_api_screen.dirty()) g_api_screen.draw();
+        delay(10);
+        return;
+    }
+
+    if (g_screen == Screen::Threads) {
+        g_threads_screen.set_chat_busy(g_chat_screen.busy());
+        if (td.wasReleased()) g_threads_screen.onTouch(td.x, td.y);
+        open_thread_from_list();
+        if (g_threads_screen.dirty()) g_threads_screen.draw();
         delay(10);
         return;
     }
