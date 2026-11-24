@@ -5,7 +5,9 @@
 
 ## [Unreleased]
 
-Этап v0.2.0 «Чат»: диалог с моделью через OpenAI-совместимый API RouterAI со
+## [0.2.0] — 2026-11-24
+
+Этап «Чат»: диалог с моделью через OpenAI-совместимый API RouterAI со
 стримингом, треды на SD, экран настроек API.
 
 ### Добавлено
@@ -456,5 +458,6 @@
 - Юнит-тесты на хосте: 78 тестов (форматирование, раскладка, настройки, список
   сетей), `./scripts/check.sh docker` зелёный.
 
-[Unreleased]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.1.0...v0.2.0
 [v0.1.0]: https://github.com/GolovkoStepan/tab5_ai_assistant/releases/tag/v0.1.0

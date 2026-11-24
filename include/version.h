@@ -3,9 +3,9 @@
 // Версия прошивки. Обновляется вместе с CHANGELOG.md и git-тегом.
 // Формат: SemVer, см. docs/DEVELOPMENT_PLAN.md
 
-#define APP_VERSION "0.1.0"
+#define APP_VERSION "0.2.0"
 #define APP_VERSION_MAJOR 0
-#define APP_VERSION_MINOR 1
+#define APP_VERSION_MINOR 2
 #define APP_VERSION_PATCH 0
 
 // Человекочитаемое имя сборки
