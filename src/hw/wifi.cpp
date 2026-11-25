@@ -207,6 +207,15 @@ void WifiManager::tick()
     }
 }
 
+int WifiManager::rssi() const
+{
+    // Не подключены — уровня нет. Драйвер в этом состоянии отдаёт 0, и он же
+    // попадает в пороги: 0 дБм выглядел бы как отличный сигнал, а на деле
+    // связи нет вовсе.
+    if (_state != State::Connected) return 0;
+    return WiFi.RSSI();
+}
+
 void WifiManager::disconnect()
 {
     if (!_begun) return;

@@ -15,6 +15,7 @@
 #include <M5Unified.h>
 
 #include "ui/draw.h"
+#include "ui/tray.h"
 
 namespace ui {
 namespace {
@@ -163,7 +164,11 @@ void HelpScreen::draw()
         _drawn_selected = _selected;
 
         M5.Display.drawFastHLine(0, kHintY - 8, M5.Display.width(), kColorFrame);
-        ui::text("↑ ↓ — выбор · Enter — открыть · Esc — закрыть меню", kMargin, kHintY, kColorFaint);
+        // Все подсказки меню — внизу, как на остальных экранах. Раньше
+        // «Ctrl+M — закрыть» стояла справа в шапке, то есть на месте трея:
+        // подсказка про закрытие оказывалась в том углу, который читают как
+        // состояние устройства, и спорила со значками Wi-Fi и батареи.
+        ui::text("↑ ↓ — выбор · Enter — открыть · Esc или Ctrl+M — закрыть", kMargin, kHintY, kColorFaint);
         return;
     }
 
@@ -173,7 +178,7 @@ void HelpScreen::draw()
 void HelpScreen::draw_rows()
 {
     ui::text("Меню и команды", kMargin, kTitleY, TFT_WHITE);
-    ui::text_right("Ctrl+M — закрыть", M5.Display.width() - kMargin, kTitleY, kColorFaint);
+    ui::draw_tray(M5.Display.width());
 
     // Заголовки колонок: без них неясно, что слева можно нажимать, а справа
     // нельзя. Это единственное место, где разница вообще видна.

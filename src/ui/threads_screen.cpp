@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "ui/draw.h"
+#include "ui/tray.h"
 #include "util/chat_list.h"
 
 namespace ui {
@@ -384,11 +385,16 @@ void ThreadsScreen::draw_header()
 
     // Открытый тред — справа: так видно, какой разговор сейчас в чате, и что
     // удаление относится не обязательно к нему.
+    //
+    // Правее — трей, поэтому подпись прижимается к его левой границе, а не к
+    // краю экрана: иначе они бы накладывались.
     if (_store != nullptr && _store->slug()[0] != '\0') {
         char right[96];
         snprintf(right, sizeof(right), "открыт: %s", _store->slug());
-        ui::text_right(right, M5.Display.width() - kMargin, kTitleY, kColorFaint);
+        ui::text_right(right, ui::tray_left_edge(M5.Display.width()), kTitleY, kColorFaint);
     }
+
+    ui::draw_tray(M5.Display.width());
 }
 
 void ThreadsScreen::draw_list()

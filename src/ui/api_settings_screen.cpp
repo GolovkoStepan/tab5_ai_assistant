@@ -13,6 +13,7 @@
 
 #include "app_config.h"
 #include "ui/draw.h"
+#include "ui/tray.h"
 #include "util/api_key.h"
 
 namespace ui {
@@ -588,17 +589,14 @@ void ApiSettingsScreen::draw_rows()
     clear_band(0, kRowsY);
     ui::text("Настройки API", kMargin, kTitleY, TFT_WHITE);
 
-    // Справа — состояние сети: без неё любые настройки бесполезны, и это первое,
-    // что нужно проверить при «не отвечает».
-    if (_wifi != nullptr) {
-        char net[64];
-        if (_wifi->connected()) {
-            snprintf(net, sizeof(net), "Wi-Fi: %s", _wifi->ip_text());
-        } else {
-            snprintf(net, sizeof(net), "Wi-Fi: нет · Ctrl+W");
-        }
-        ui::text_right(net, M5.Display.width() - kMargin, kTitleY, _wifi->connected() ? TFT_GREEN : kColorBad);
+    // Справа — только проблема: когда сети нет, настройки бесполезны, и надо
+    // знать, что идти за ней в Ctrl+W. «сеть есть» здесь ничего не добавляло:
+    // значок в трее и без того показывает, что подключение есть.
+    if (_wifi != nullptr && !_wifi->connected()) {
+        ui::text_right("нет сети · Ctrl+W", ui::tray_left_edge(M5.Display.width()), kTitleY, kColorBad);
     }
+
+    ui::draw_tray(M5.Display.width());
 
     for (size_t i = 0; i < kFieldCount; ++i) {
         draw_field_row(static_cast<Field>(i));

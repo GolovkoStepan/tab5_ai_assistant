@@ -19,6 +19,7 @@
 #include "app_config.h"
 #include "hw/clock.h"
 #include "ui/draw.h"
+#include "ui/tray.h"
 #include "util/chat_history.h"
 #include "util/chat_measure.h"
 #include "util/chat_view.h"
@@ -1590,30 +1591,13 @@ void ChatScreen::draw_title()
 {
     M5.Display.fillRect(0, 0, M5.Display.width(), kFeedY - 4, TFT_BLACK);
 
-    // Статус сети слева от правого края показываем ВСЕГДА: пустое место
-    // читается как «экран сломался», а «нет Wi-Fi» без адреса не отвечает на
-    // вопрос «а сейчас-то связь есть?».
-    char net[64];
-    uint16_t net_color = kColorPartial;
-    if (_wifi != nullptr && _wifi->connected()) {
-        const char* ip = _wifi->ip_text();
-        if (ip != nullptr && ip[0] != '\0') {
-            snprintf(net, sizeof(net), "Wi-Fi %s", ip);
-        } else {
-            snprintf(net, sizeof(net), "Wi-Fi есть");
-        }
-        net_color = kColorAssistant;
-    } else if (_wifi != nullptr && _wifi->connecting()) {
-        snprintf(net, sizeof(net), "Wi-Fi: подключение…");
-    } else {
-        snprintf(net, sizeof(net), "нет Wi-Fi");
-    }
-
-    // Ширину статуса мерим, а не угадываем: адрес бывает длинным, и зашитый
-    // отступ то оставлял бы пустую полосу, то наезжал на заголовок.
-    M5.Display.setFont(ui::font());
-    const int net_w = M5.Display.textWidth(net);
-    const int title_room = M5.Display.width() - 2 * kMarginX - net_w - 16;
+    // Состояние сети переехало в трей (правый верхний угол, как в macOS):
+    // оно нужно на всех экранах, а не только в чате. Здесь остаётся заголовок
+    // треда, и место под него кончается там, где начинается трей.
+    //
+    // Уйти в трей и оставить адрес в заголовке значило бы показывать одно и то
+    // же дважды — на 1280 px это ещё и отнимало место у названия треда.
+    const int title_room = ui::tray_left_edge(M5.Display.width()) - kMarginX - 16;
 
     char title[96];
     char name[48];
@@ -1627,7 +1611,7 @@ void ChatScreen::draw_title()
     // разрезанная посреди UTF-8 строка дала бы мусорный глиф.
     static char title_buf[128];
     ui::text(ui::fit_width(title, title_room, title_buf, sizeof(title_buf)), kMarginX, kTitleY, TFT_WHITE);
-    ui::text_right(net, M5.Display.width() - kMarginX, kTitleY, net_color);
+    ui::draw_tray(M5.Display.width());
 }
 
 void ChatScreen::draw_scrollbar(size_t total, size_t max_lines)

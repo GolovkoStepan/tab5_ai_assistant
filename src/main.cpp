@@ -31,9 +31,12 @@
 #include "ui/draw.h"
 #include "ui/help_screen.h"
 #include "ui/notes_screen.h"
+#include "ui/splash.h"
 #include "ui/threads_screen.h"
+#include "ui/tray.h"
 #include "ui/wifi_screen.h"
 #include "util/format.h"
+#include "util/tray_state.h"
 #include "version.h"
 
 hw::Keyboard g_keyboard;
@@ -188,18 +191,26 @@ const char* chargeStateName(m5::charge_state_t state)
     }
 }
 
-/// Строка состояния питания. Проценты показываем только когда по току видно,
-/// что батарея реально работает: иначе они врут (100% на пустом отсеке).
+/// Строка состояния питания.
+///
+/// Проценты показываем **только на разряде**: на Tab5 `getBatteryLevel()`
+/// считает их по напряжению на ячейку, а зарядник держит 8.4 В — верхнюю
+/// границу формулы. Поэтому при кабеле там всегда 100 % при любом реальном
+/// заряде, и выводить это число значит врать в самой диагностике, которая
+/// нужна как раз для того, чтобы понять настоящее состояние.
 void formatPowerStatus(char* out, size_t out_len)
 {
     const int mv = M5.Power.getBatteryVoltage();
     const int ma = M5.Power.getBatteryCurrent();
     const auto state = M5.Power.getChargeState();
 
-    const bool battery_working = state == m5::charge_state_t::charging || state == m5::charge_state_t::discharging;
-
-    if (battery_working) {
+    if (state == m5::charge_state_t::discharging) {
         snprintf(out, out_len, "%d%% %.2fВ %+dмА", M5.Power.getBatteryLevel(), mv / 1000.0f, ma);
+    } else if (state == m5::charge_state_t::charging) {
+        // «заряд» вместо числа — по той же причине, что и в трее: во время
+        // заряда показание вольтметра упирается в потолок формулы, и процент
+        // оттуда был бы нарисован, а не измерен.
+        snprintf(out, out_len, "заряд %.2fВ %+dмА", mv / 1000.0f, ma);
     } else {
         snprintf(out, out_len, "%.2fВ %+dмА", mv / 1000.0f, ma);
     }
@@ -513,6 +524,11 @@ void drawAll()
 
     drawText("Ctrl+Space — раскладка · Ctrl+L — сброс покрытия · Ctrl+D — чат · Ctrl+M — меню", kMargin, kHintY - 16,
         TFT_DARKGRAY);
+
+    // Трей и здесь: экран диагностики — тоже экран устройства, а заряд и сеть
+    // нужны на нём не меньше. Тестовая строка кириллицы кончается на 948 px,
+    // трей начинается с 1004 — они не пересекаются.
+    ui::draw_tray(M5.Display.width());
 }
 
 }  // namespace
@@ -588,6 +604,89 @@ bool open_thread_from_list()
     return true;
 }
 
+/// Последнее прочитанное состояние питания.
+///
+/// Читается раз в секунду в update_power(): состояние заряда приходит по I2C с
+/// INA226, а кадров при delay(10) около сотни в секунду. Заряд и разряд не
+/// меняются за десять миллисекунд, а шина нужна клавиатуре.
+///
+/// Хранится не внутри функции, потому что нужен в двух местах: светодиоды
+/// клавиатуры и трей. Два независимых опроса давали бы расхождение — правый
+/// светодиод зелёный, а трей показывает «садится».
+///
+/// Напряжения здесь нет намеренно: в трее оно не показывается (при пустом
+/// отсеке INA226 видит холостой ход зарядного узла, а тот скачет — см.
+/// include/util/tray_state.h), а диагностика читает его сама при старте.
+struct PowerSnapshot {
+    m5::charge_state_t state{m5::charge_state_t::not_initialized};
+    int level{-1};
+    /// Аккумулятора нет. См. tray::next_presence: единственное доказательство
+    /// наличия — ток, единственное доказательство отсутствия — напряжение ниже
+    /// физически возможного для 2S-сборки.
+    bool absent{false};
+};
+
+PowerSnapshot g_power;
+unsigned long g_power_at_ms = 0;
+
+/// Обновить состояние питания, если прошла секунда.
+void update_power()
+{
+    const unsigned long now = millis();
+    if (g_power_at_ms != 0 && now - g_power_at_ms < 1000) return;
+    g_power_at_ms = now;
+
+    g_power.state = M5.Power.getChargeState();
+
+    // Наличие аккумулятора выводится отдельно от состояния заряда: M5Unified на
+    // Tab5 видит только направление тока, а «тока нет» — это и «заряжен», и
+    // «аккумулятора нет» (Р-016). Отсутствие доказывается напряжением, которое
+    // в пустом отсеке «дышит» между 4.34 и 8.37 В (холостой ход IP2326).
+    static tray::Presence presence;
+    presence = tray::next_presence(presence, M5.Power.getBatteryCurrent() != 0, M5.Power.getBatteryVoltage());
+    g_power.absent = presence.absent;
+
+    // Проценты достоверны только на разряде: при заряде напряжение подпёрто
+    // до верхней границы формулы `getBatteryLevel()`, а на пустом отсеке она
+    // и вовсе гуляет между 0 и 100 % вместе с «дыханием» зарядного узла.
+    // Правило одно на трей, светодиоды и строку диагностики, поэтому
+    // считается здесь, а не в каждом потребителе.
+    g_power.level =
+        (g_power.state == m5::charge_state_t::discharging && !g_power.absent) ? M5.Power.getBatteryLevel() : -1;
+}
+
+/// Собрать снимок для трея.
+tray::Info build_tray_info()
+{
+    tray::Info info;
+
+    if (g_wifi.connected()) {
+        info.wifi_connected = true;
+        info.wifi_level = tray::wifi_level(true, g_wifi.rssi());
+    } else if (g_wifi.connecting()) {
+        info.wifi_connecting = true;
+    }
+    tray::wifi_label(info.wifi_connected, info.wifi_connecting, info.wifi_text, sizeof(info.wifi_text));
+
+    // Состояние заряда с памятью: M5Unified на Tab5 различает только
+    // направление тока, а «тока нет» — это и «заряжен», и «аккумулятора нет».
+    // Вывод «заряжено» делается лишь потому, что заряд в этой сессии уже шёл,
+    // и лишь пока известно, что аккумулятор на месте.
+    static tray::Charge charge = tray::Charge::Unknown;
+    charge = tray::next_charge(charge, g_power.state == m5::charge_state_t::charging,
+        g_power.state == m5::charge_state_t::discharging, g_power.absent);
+    info.charge = charge;
+
+    // Процент достоверен только на разряде. Пока идёт заряд,
+    // `getBatteryLevel()` показывает 100 % при любом реальном уровне (см.
+    // include/util/tray_state.h).
+    info.battery_known = charge == tray::Charge::Discharging && g_power.level >= 0;
+    info.battery_percent = g_power.level;
+    tray::battery_label(charge, info.battery_known, info.battery_percent, info.battery_text, sizeof(info.battery_text));
+
+    return info;
+}
+
 /// Обновить светодиоды клавиатуры.
 ///
 /// Вызывается раз в кадр: драйвер сам не трогает I2C, если ни цвет, ни яркость
@@ -599,34 +698,54 @@ void update_leds()
     led::Status s;
     g_chat_screen.fill_model_status(s);
 
-    // Питание. Состояние заряда M5Unified определяет по току — это
-    // единственный достоверный признак того, что аккумулятор реально есть и
-    // работает: напряжение на пустом отсеке тоже ненулевое (см.
-    // docs/HARDWARE_VERIFICATION.md). Проценты показываем только при известном
-    // направлении тока, иначе getBatteryLevel() врёт 100 %.
-    //
-    // Опрашиваем раз в секунду, а не каждый кадр: состояние заряда читается по
-    // I2C с INA226, а кадров при delay(10) около сотни в секунду. Заряд и
-    // разряд не меняются за десять миллисекунд, а шина нужна клавиатуре.
-    static unsigned long power_at_ms = 0;
-    static m5::charge_state_t power_state = m5::charge_state_t::not_initialized;
-    static int power_level = -1;
+    s.charging = g_power.state == m5::charge_state_t::charging;
+    s.discharging = g_power.state == m5::charge_state_t::discharging;
 
-    const unsigned long now = millis();
-    if (power_at_ms == 0 || now - power_at_ms >= 1000) {
-        power_at_ms = now;
-        power_state = M5.Power.getChargeState();
-        const bool battery_working =
-            power_state == m5::charge_state_t::charging || power_state == m5::charge_state_t::discharging;
-        power_level = battery_working ? M5.Power.getBatteryLevel() : -1;
+    // Аккумулятора нет — гасим правый светодиод. Без этого одиночный выброс
+    // тока при снятии батареи (направление определяется по току, а он в этот
+    // момент скачет) мог показать зелёный «всё в порядке» на пустом отсеке —
+    // то есть соврать ровно так же, как врал трей.
+    if (g_power.absent) {
+        s.charging = false;
+        s.discharging = false;
     }
 
-    s.charging = power_state == m5::charge_state_t::charging;
-    s.discharging = power_state == m5::charge_state_t::discharging;
-    s.battery_level = power_level;
+    s.battery_level = g_power.level;
 
     const led::Colors c = led::compute(s);
     g_keyboard.setLeds(c.model, c.power);
+}
+
+/// Показать трей на текущем экране, если снимок изменился.
+///
+/// Отдельно от update_leds(), хотя снимок тот же: светодиоды обновляются
+/// каждый кадр (драйвер сам отсекает повторы по I2C), а трей — только при
+/// изменении. Иначе сорок строк с фоном перерисовывались бы сто раз в секунду.
+///
+/// Снимок берётся раз в секунду, как и питание. Причина — RSSI: он меняется от
+/// помех на единицы дБм, и опрос каждый кадр заставлял бы перерисовывать
+/// значок почти непрерывно. Глазами это читается как мерцание, а пользы в
+/// уровне сигнала с точностью до кадра нет.
+void update_tray()
+{
+    static tray::Info drawn;
+    static bool first = true;
+    static unsigned long at_ms = 0;
+
+    const unsigned long now = millis();
+    if (!first && now - at_ms < 1000) return;
+    at_ms = now;
+
+    const tray::Info info = build_tray_info();
+    ui::set_live_info(info);
+
+    if (!first && info == drawn) return;
+    first = false;
+    drawn = info;
+
+    // Рисуем на любом экране, включая диагностику: drawAll() рисует трей при
+    // входе, но показания меняются и после — заряд садится, сеть пропадает.
+    ui::draw_tray(M5.Display.width());
 }
 
 }  // namespace
@@ -649,12 +768,19 @@ void setup()
     M5.Display.setBrightness(128);
     M5.Display.fillScreen(TFT_BLACK);
 
+    // Заставка как только есть куда рисовать. Дальше каждый этап инициализации
+    // отмечается в ней же: экран не остаётся чёрным на несколько секунд, и
+    // видно, на чём именно устройство остановилось, если что-то не поднимется.
+    ui::splash_begin(M5.Display.width(), M5.Display.height());
+
     logLine("Экран: %dx%d, поворот %d", M5.Display.width(), M5.Display.height(), M5.Display.getRotation());
     logLine("PSRAM: %u КБ, flash: %u МБ", (unsigned)(ESP.getPsramSize() / 1024),
         (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)));
     logLine("Свободно: heap %u КБ, PSRAM %u КБ", (unsigned)(ESP.getFreeHeap() / 1024),
         (unsigned)(ESP.getFreePsram() / 1024));
     logLine("CPU: %u МГц", (unsigned)getCpuFrequencyMhz());
+
+    ui::splash_step(ui::SplashStep::Display, "1280×720");
 
     // --- Питание ------------------------------------------------------------
     // Напряжение и ток INA226 печатаем как есть, без вывода «есть батарея»:
@@ -667,10 +793,15 @@ void setup()
     logLine("Наличие АКБ: %s", M5.Power.getBatteryPresence() == m5::battery_presence_t::present
                                    ? "есть"
                                    : "не определяется (нет аппаратного признака)");
-    logLine("Проценты (считаются от напряжения): %d %%", M5.Power.getBatteryLevel());
+    logLine("Проценты (считаются от напряжения, при заряде недостоверны): %d %%", M5.Power.getBatteryLevel());
 
     char power_status[48];
     formatPowerStatus(power_status, sizeof(power_status));
+
+    // Первое чтение состояния питания для трея и светодиодов. Дальше loop()
+    // обновляет его раз в секунду; без этого до первой секунды трей собирался
+    // бы из нулей и показывал «0.00 В».
+    update_power();
 
     // --- SD -----------------------------------------------------------------
     // Вариант платы m5stack_tab5 не задаёт BOARD_SDMMC_POWER_CHANNEL, поэтому
@@ -693,11 +824,15 @@ void setup()
         logLine("SD: НЕ смонтирована");
     }
 
+    ui::splash_step(ui::SplashStep::Storage, sd_ok ? sd_size : "нет карты");
+
     // --- Настройки ----------------------------------------------------------
     // Секреты читаются из NVS в любом случае, файл — только если SD доступна.
     const bool settings_ok = g_settings.begin();
     logLine("Настройки: %s, модель %s, таймзона %s", settings_ok ? "из файла" : "по умолчанию",
         g_settings.config().api_model, g_settings.config().timezone);
+
+    ui::splash_step(ui::SplashStep::Settings, g_settings.config().api_model);
 
     // --- Клавиатура ---------------------------------------------------------
     const bool kbd_ok = g_keyboard.begin();
@@ -710,6 +845,8 @@ void setup()
     } else {
         logLine("Клавиатура: НЕ отвечает на адресе 0x%02X", cfg::kKeyboardAddr);
     }
+
+    ui::splash_step(ui::SplashStep::Keyboard, kbd_ok ? "A164" : "не найдена");
 
     // Настройки, которые видны сразу: яркость и раскладка. Читались они и
     // раньше, но не применялись — config.json существовал, а экран и
@@ -727,11 +864,29 @@ void setup()
     // --- Wi-Fi --------------------------------------------------------------
     // Подключение к сохранённой сети запускаем в фоне: неблокирующий start
     // и tick() в цикле, иначе первый экран замирал бы до 20 секунд.
+    //
+    // Сам `begin()` при этом блокирующий: на живой плате он занимает 2.3 с
+    // (первый WiFi.mode поднимает SDIO к сопроцессору C6). Именно поэтому шаг
+    // помечается ДО вызова, а не после: иначе полоса стояла бы 2.3 с без
+    // объяснения, и заставка выглядела бы разыгранной. Здесь же на экране
+    // видно «Сеть ● поднимаю радио…» — то есть что именно происходит.
+    //
+    // Блокирующее ожидание оставлено в заставке намеренно. Унести его в loop()
+    // можно, но тогда на 2.3 с замирал бы уже рабочий экран с меню, где любое
+    // нажатие проглатывается, — а заставка для того и нужна, чтобы старт
+    // пережидался на экране, который этого и ожидает.
+    ui::splash_step(ui::SplashStep::Network, "поднимаю радио…");
+
     const bool wifi_ok = g_wifi.begin();
     if (wifi_ok) {
         g_wifi.auto_connect(g_settings.secrets());
+        // Подпись меняется на настоящую: радио уже поднято, а DHCP идёт в фоне.
+        ui::splash_step(ui::SplashStep::Network, "подключаюсь в фоне");
     } else {
         logLine("Wi-Fi: радио не поднялось");
+        // Отдельный вызов, потому что при отказе подпись должна измениться:
+        // «поднимаю радио…» на неудавшемся шаге было бы неправдой.
+        ui::splash_step(ui::SplashStep::Network, "радио нет");
     }
 
     // Экран Wi-Fi привязываем к драйверам здесь: его tick() работает с этого
@@ -764,11 +919,31 @@ void setup()
         sd_ok ? " RW" : " RO", wifi_ok ? "OK" : "нет", kbd_ok ? "v1" : "нет");
     logLine("Статус: %s", g_status);
 
-    // Стартуем в чате: это основной экран устройства. Диагностика осталась
-    // доступной, но по умолчанию не показывается.
-    g_screen = Screen::Chat;
-    g_chat_screen.onEnter();
-    g_chat_screen.draw();  // не drawAll(): он рисует диагностический экран
+    // Стартуем в меню, а не в чате. При включении человек ещё не знает, зачем
+    // взял устройство: меню показывает разом, что оно умеет и по какой
+    // клавише, — это дешевле, чем вспоминать команды. Из меню в чат ведёт
+    // Enter по первому пункту, а Esc возвращает в чат по умолчанию
+    // (g_help_return = Chat).
+    //
+    // Чат всё равно готовим в фоне: onEnter() в меню не вызывается, поэтому
+    // тред подгружаем здесь же. Иначе первый вход в чат начинался бы с пустой
+    // ленты и чтения SD прямо на глазах.
+    //
+    // Снимок трея собираем до первой отрисовки: шапка рисует трей из
+    // ui::live_info(), и без этого до первого прохода loop() на экране был бы
+    // пустой трей — рамка батареи без подписи и палочки без уровня.
+    ui::set_live_info(build_tray_info());
+
+    g_chat_screen.onEnter();  // подготовить тред, но не показывать
+
+    // Заставка досматривается здесь, а не раньше: к этому моменту всё уже
+    // готово, и «Готово» с полной полосой — правда, а не обещание.
+    ui::splash_finish();
+
+    g_help_return = Screen::Chat;
+    g_screen = Screen::Help;
+    g_help_screen.onEnter();
+    g_help_screen.draw();
 }
 
 void loop()
@@ -955,9 +1130,45 @@ void loop()
     g_chat_screen.tick();
     g_api_screen.tick();
     hw::clock_sync::tick(g_wifi.connected());
+    update_power();
+    update_tray();
     update_leds();
 
     const auto& td = M5.Touch.getDetail();
+
+    // --- Тап по трею ---------------------------------------------------------
+    // Проверяется ДО маршрутизации по экранам: трей есть на всех, и его
+    // области не совпадают с рабочими областями экранов (шапка у всех
+    // неинтерактивна). Как в macOS: значок сети ведёт к настройкам сети,
+    // значок батареи — к диагностике питания.
+    //
+    // Блокировка несохранённых правок действует и здесь: тап по трею — такая
+    // же смена экрана, как Ctrl+W, и молча выбросить правку он не должен.
+    if (td.wasReleased()) {
+        const ui::Rect wifi_r = ui::wifi_rect(M5.Display.width());
+        const ui::Rect batt_r = ui::battery_rect(M5.Display.width());
+        const bool nav_blocked = g_screen == Screen::Notes && g_notes_screen.has_unsaved_edits();
+
+        if (wifi_r.contains(td.x, td.y)) {
+            if (nav_blocked) {
+                g_notes_screen.notice("Есть несохранённые правки — Ctrl+S сохранить · Esc выйти");
+            } else {
+                switch_screen(g_screen == Screen::Wifi ? Screen::Chat : Screen::Wifi);
+            }
+            delay(10);
+            return;
+        }
+
+        if (batt_r.contains(td.x, td.y)) {
+            if (nav_blocked) {
+                g_notes_screen.notice("Есть несохранённые правки — Ctrl+S сохранить · Esc выйти");
+            } else {
+                switch_screen(g_screen == Screen::Diagnostic ? Screen::Chat : Screen::Diagnostic);
+            }
+            delay(10);
+            return;
+        }
+    }
 
     if (g_screen == Screen::Chat) {
         if (td.wasReleased()) g_chat_screen.onTouch(td.x, td.y);

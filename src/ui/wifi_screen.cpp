@@ -11,6 +11,7 @@
 
 #include "app_config.h"
 #include "ui/draw.h"
+#include "ui/tray.h"
 
 namespace ui {
 namespace {
@@ -407,7 +408,9 @@ void WifiScreen::draw()
 
     if (_redraw_title) {
         _redraw_title = false;
-        clear_band(kTitleY, 32);
+        // Ширина — только до трея: полоса заголовка раньше шла до правого края
+        // и стирала значки при каждом обновлении состояния сети.
+        M5.Display.fillRect(0, kTitleY, ui::tray_left_edge(M5.Display.width()), 32, TFT_BLACK);
         draw_title();
     }
     if (_redraw_list) {
@@ -437,8 +440,14 @@ void WifiScreen::draw_title()
 {
     ui::text("Настройка Wi-Fi", kMargin, kTitleY, TFT_WHITE);
 
-    if (!_wifi) return;
+    if (!_wifi) {
+        ui::draw_tray(M5.Display.width());
+        return;
+    }
 
+    // Это экран про Wi-Fi, поэтому имя сети и адрес живут здесь, а не в трее:
+    // там значок отвечает только на вопрос «связь есть?», а адрес отнимал
+    // место у заголовка всех экранов.
     char right[128];
     switch (_wifi->state()) {
     case hw::WifiManager::State::Connected:
@@ -452,7 +461,8 @@ void WifiScreen::draw_title()
     }
 
     const uint16_t color = _wifi->connected() ? TFT_GREEN : TFT_CYAN;
-    ui::text_right(right, M5.Display.width() - kMargin, kTitleY, color);
+    ui::text_right(right, ui::tray_left_edge(M5.Display.width()), kTitleY, color);
+    ui::draw_tray(M5.Display.width());
 }
 
 void WifiScreen::draw_signal(int x, int y, int rssi)

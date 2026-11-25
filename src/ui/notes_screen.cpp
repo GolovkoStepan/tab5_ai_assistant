@@ -21,6 +21,7 @@
 #include "app_config.h"
 #include "hw/clock.h"
 #include "ui/draw.h"
+#include "ui/tray.h"
 #include "util/text_layout.h"
 
 namespace ui {
@@ -868,9 +869,13 @@ void NotesScreen::draw_header()
 
     static char buf[192];
 
+    // Правее этой границы — трей. Все правые подписи шапки кончаются здесь,
+    // иначе они наезжали бы на значок батареи.
+    const int right_edge = ui::tray_left_edge(M5.Display.width());
+
     if (_mode == Mode::View || _mode == Mode::Edit) {
         const char* title = _meta.title[0] != '\0' ? _meta.title : _rel;
-        const int room = M5.Display.width() - 2 * kMargin - 260;
+        const int room = right_edge - kMargin - 260;
         ui::text(ui::fit_width(title, room, buf, sizeof(buf)), kMargin, kHeaderY, TFT_WHITE);
 
         // Путь — справа: по заголовку не видно, в какой папке документ, а при
@@ -879,14 +884,15 @@ void NotesScreen::draw_header()
         // ставим сами: склейка подряд дала бы «/noteshome/x.md».
         static char path[160];
         snprintf(path, sizeof(path), "%s/%s", cfg::kNotesDir, _rel);
-        ui::text_right(ui::fit_width(path, 240, buf, sizeof(buf)), M5.Display.width() - kMargin, kHeaderY, kColorFaint);
+        ui::text_right(ui::fit_width(path, 240, buf, sizeof(buf)), right_edge, kHeaderY, kColorFaint);
+        ui::draw_tray(M5.Display.width());
         return;
     }
 
     if (_mode == Mode::Search) {
         snprintf(buf, sizeof(buf), "Поиск: %s", _query);
-        ui::text(ui::fit_width(buf, M5.Display.width() - 2 * kMargin, _scratch, sizeof(_scratch)), kMargin, kHeaderY,
-            TFT_WHITE);
+        ui::text(ui::fit_width(buf, right_edge - kMargin, _scratch, sizeof(_scratch)), kMargin, kHeaderY, TFT_WHITE);
+        ui::draw_tray(M5.Display.width());
         return;
     }
 
@@ -898,8 +904,10 @@ void NotesScreen::draw_header()
     ui::text(buf, kMargin, kHeaderY, TFT_WHITE);
 
     if (_docs != nullptr && !_docs->ready()) {
-        ui::text_right("нет SD-карты", M5.Display.width() - kMargin, kHeaderY, kColorBad);
+        ui::text_right("нет SD-карты", right_edge, kHeaderY, kColorBad);
     }
+
+    ui::draw_tray(M5.Display.width());
 }
 
 void NotesScreen::draw_list()
