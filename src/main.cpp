@@ -5,10 +5,12 @@
  * через OpenAI-совместимый API (v0.2.0). Треды лежат на SD в JSONL, ключ API —
  * в NVS.
  *
- * Маршрутизация: Ctrl+W — Wi-Fi, Ctrl+A — настройки API, Ctrl+D — диагностика,
- * Esc с любого экрана возвращает в чат. Диагностика — наследство этапа v0.1.0
- * (матрица клавиатуры 5x14, покрытие клавиш, калибровочные мишени тача); она
- * больше не стартовый экран, но осталась инструментом проверки железа.
+ * Маршрутизация: Ctrl+M — меню со всеми разделами и справкой, Ctrl+W — Wi-Fi,
+ * Ctrl+A — настройки API, Ctrl+T — треды, Ctrl+O — документы, Ctrl+D —
+ * диагностика; Esc с любого экрана возвращает в чат (а из меню — туда, откуда
+ * его открыли). Диагностика — наследство этапа v0.1.0 (матрица клавиатуры 5x14,
+ * покрытие клавиш, калибровочные мишени тача); она больше не стартовый экран,
+ * но осталась инструментом проверки железа.
  */
 
 #include <M5Unified.h>
@@ -27,6 +29,7 @@
 #include "ui/api_settings_screen.h"
 #include "ui/chat_screen.h"
 #include "ui/draw.h"
+#include "ui/help_screen.h"
 #include "ui/notes_screen.h"
 #include "ui/threads_screen.h"
 #include "ui/wifi_screen.h"
@@ -44,6 +47,7 @@ ui::ChatScreen g_chat_screen;
 ui::ApiSettingsScreen g_api_screen;
 ui::ThreadsScreen g_threads_screen;
 ui::NotesScreen g_notes_screen;
+ui::HelpScreen g_help_screen;
 
 /// Какой экран сейчас на дисплее.
 ///
@@ -57,8 +61,13 @@ enum class Screen : uint8_t {
     Notes,
     Wifi,
     ApiSettings,
+    Help,
 };
 Screen g_screen = Screen::Chat;
+
+/// Откуда открыли меню помощи: Esc и Ctrl+M возвращают туда, а не в чат.
+/// Из архива возврат в чат читался бы как потеря места, где ты был.
+Screen g_help_return = Screen::Chat;
 
 namespace {
 
@@ -502,8 +511,8 @@ void drawAll()
     drawTargets();
     drawTouchText();
 
-    drawText("Ctrl+Space — раскладка · Ctrl+L — сброс покрытия · Ctrl+D — чат · Ctrl+W — Wi-Fi · Ctrl+A — API", kMargin,
-        kHintY - 16, TFT_DARKGRAY);
+    drawText("Ctrl+Space — раскладка · Ctrl+L — сброс покрытия · Ctrl+D — чат · Ctrl+M — меню", kMargin, kHintY - 16,
+        TFT_DARKGRAY);
 }
 
 }  // namespace
@@ -523,6 +532,7 @@ void switch_screen(Screen next)
     case Screen::Notes: g_notes_screen.onExit(); break;
     case Screen::Wifi: g_wifi_screen.onExit(); break;
     case Screen::ApiSettings: g_api_screen.onExit(); break;
+    case Screen::Help: break;
     case Screen::Diagnostic: break;
     }
 
@@ -534,6 +544,10 @@ void switch_screen(Screen next)
     case Screen::Notes: g_notes_screen.onEnter(); break;
     case Screen::Wifi: g_wifi_screen.onEnter(); break;
     case Screen::ApiSettings: g_api_screen.onEnter(); break;
+    // Помощь возвращает туда, откуда её открыли: Esc из меню, открытого в
+    // архиве, должен вернуть в архив, а не в чат. Это делает main, а не экран:
+    // экран не знает, кто его позвал.
+    case Screen::Help: g_help_screen.onEnter(); break;
     case Screen::Diagnostic: drawAll(); break;
     }
 }
@@ -743,6 +757,7 @@ void setup()
     // поднялся: ready() проверяется внутри, и экран покажет причину, а не
     // пустоту вместо неё.
     g_notes_screen.init(g_doc_store, g_settings);
+    g_help_screen.init();
 
     // Компактная строка состояния: подробности остались в Serial.
     snprintf(g_status, sizeof(g_status), "%s · SD %s%s · Wi-Fi %s · клав %s", power_status, sd_size,
@@ -763,6 +778,7 @@ void loop()
     // --- Клавиатура ---------------------------------------------------------
     hw::KeyEvent ev;
     bool last_changed = false;
+
     while (g_keyboard.poll(ev)) {
         // Переключение раскладки обрабатывается на любом экране: драйвер уже
         // сменил её внутри poll(), а здесь мы её запоминаем. Раньше это делал
@@ -802,7 +818,7 @@ void loop()
             const bool nav = strcmp(ev.utf8, "w") == 0 || strcmp(ev.utf8, "ц") == 0 || strcmp(ev.utf8, "a") == 0 ||
                              strcmp(ev.utf8, "ф") == 0 || strcmp(ev.utf8, "t") == 0 || strcmp(ev.utf8, "е") == 0 ||
                              strcmp(ev.utf8, "o") == 0 || strcmp(ev.utf8, "щ") == 0 || strcmp(ev.utf8, "d") == 0 ||
-                             strcmp(ev.utf8, "в") == 0;
+                             strcmp(ev.utf8, "в") == 0 || strcmp(ev.utf8, "m") == 0 || strcmp(ev.utf8, "ь") == 0;
             if (nav && g_screen == Screen::Notes && g_notes_screen.has_unsaved_edits()) {
                 g_notes_screen.notice("Есть несохранённые правки — Ctrl+S сохранить · Esc выйти");
                 continue;
@@ -830,6 +846,29 @@ void loop()
                 switch_screen(g_screen == Screen::Diagnostic ? Screen::Chat : Screen::Diagnostic);
                 continue;
             }
+            // Ctrl+M — меню и справка. «ь» — та же клавиша в ЙЦУКЕН.
+            //
+            // Меню помнит, откуда его открыли: Esc возвращает туда. Уходить
+            // всегда в чат значило бы, что из архива после справки документ
+            // приходится открывать заново.
+            if (strcmp(ev.utf8, "m") == 0 || strcmp(ev.utf8, "ь") == 0) {
+                if (g_screen == Screen::Help) {
+                    switch_screen(g_help_return);
+                } else {
+                    // Из диагностики тоже: меню — отдельный экран, проверке
+                    // железа оно не мешает, а вернёт обратно туда же.
+                    g_help_return = g_screen;
+                    switch_screen(Screen::Help);
+                }
+                continue;
+            }
+        }
+
+        // Меню обрабатывает клавиши само: стрелки, Enter и Esc. Ctrl+M разобран
+        // выше — в списке глобальных команд, потому что он и открывает меню.
+        if (g_screen == Screen::Help) {
+            if (g_help_screen.onKey(ev)) switch_screen(g_help_return);
+            continue;
         }
 
         // Экраны со своим состоянием обрабатывают события сами, включая Esc.
@@ -954,6 +993,29 @@ void loop()
         g_notes_screen.tick();
         if (td.wasReleased()) g_notes_screen.onTouch(td.x, td.y);
         if (g_notes_screen.dirty()) g_notes_screen.draw();
+        delay(10);
+        return;
+    }
+
+    if (g_screen == Screen::Help) {
+        // Переход выполняет main: экран помощи не знает про остальные экраны.
+        if (td.wasReleased()) g_help_screen.onTouch(td.x, td.y);
+
+        const ui::HelpScreen::Target t = g_help_screen.take_target();
+        if (t != ui::HelpScreen::Target::None) {
+            switch (t) {
+            case ui::HelpScreen::Target::Threads: switch_screen(Screen::Threads); break;
+            case ui::HelpScreen::Target::Notes: switch_screen(Screen::Notes); break;
+            case ui::HelpScreen::Target::ApiSettings: switch_screen(Screen::ApiSettings); break;
+            case ui::HelpScreen::Target::Wifi: switch_screen(Screen::Wifi); break;
+            case ui::HelpScreen::Target::Diagnostic: switch_screen(Screen::Diagnostic); break;
+            case ui::HelpScreen::Target::None: break;
+            }
+            delay(10);
+            return;
+        }
+
+        if (g_help_screen.dirty()) g_help_screen.draw();
         delay(10);
         return;
     }
