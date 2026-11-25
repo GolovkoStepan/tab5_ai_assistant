@@ -20,12 +20,14 @@
 #include "hw/api_client.h"
 #include "hw/chat_store.h"
 #include "hw/clock.h"
+#include "hw/doc_store.h"
 #include "hw/keyboard.h"
 #include "hw/settings_store.h"
 #include "hw/wifi.h"
 #include "ui/api_settings_screen.h"
 #include "ui/chat_screen.h"
 #include "ui/draw.h"
+#include "ui/notes_screen.h"
 #include "ui/threads_screen.h"
 #include "ui/wifi_screen.h"
 #include "util/format.h"
@@ -36,10 +38,12 @@ hw::SettingsStore g_settings;
 hw::WifiManager g_wifi;
 hw::ApiClient g_api;
 hw::ChatStore g_chat_store;
+hw::DocStore g_doc_store;
 ui::WifiScreen g_wifi_screen;
 ui::ChatScreen g_chat_screen;
 ui::ApiSettingsScreen g_api_screen;
 ui::ThreadsScreen g_threads_screen;
+ui::NotesScreen g_notes_screen;
 
 /// Какой экран сейчас на дисплее.
 ///
@@ -50,6 +54,7 @@ enum class Screen : uint8_t {
     Diagnostic,
     Chat,
     Threads,
+    Notes,
     Wifi,
     ApiSettings,
 };
@@ -515,6 +520,7 @@ void switch_screen(Screen next)
     switch (g_screen) {
     case Screen::Chat: g_chat_screen.onExit(); break;
     case Screen::Threads: g_threads_screen.onExit(); break;
+    case Screen::Notes: g_notes_screen.onExit(); break;
     case Screen::Wifi: g_wifi_screen.onExit(); break;
     case Screen::ApiSettings: g_api_screen.onExit(); break;
     case Screen::Diagnostic: break;
@@ -525,6 +531,7 @@ void switch_screen(Screen next)
     switch (g_screen) {
     case Screen::Chat: g_chat_screen.onEnter(); break;
     case Screen::Threads: g_threads_screen.onEnter(); break;
+    case Screen::Notes: g_notes_screen.onEnter(); break;
     case Screen::Wifi: g_wifi_screen.onEnter(); break;
     case Screen::ApiSettings: g_api_screen.onEnter(); break;
     case Screen::Diagnostic: drawAll(); break;
@@ -565,6 +572,47 @@ bool open_thread_from_list()
     switch_screen(Screen::Chat);
     g_chat_screen.draw();
     return true;
+}
+
+/// Обновить светодиоды клавиатуры.
+///
+/// Вызывается раз в кадр: драйвер сам не трогает I2C, если ни цвет, ни яркость
+/// не изменились, — а меняются они редко. Вызов дешёвый и на каждом кадре
+/// нужен, потому что состояние берётся из разных мест (экран чата, INA226),
+/// и собирать его «по событию» значило бы забыть про половину переходов.
+void update_leds()
+{
+    led::Status s;
+    g_chat_screen.fill_model_status(s);
+
+    // Питание. Состояние заряда M5Unified определяет по току — это
+    // единственный достоверный признак того, что аккумулятор реально есть и
+    // работает: напряжение на пустом отсеке тоже ненулевое (см.
+    // docs/HARDWARE_VERIFICATION.md). Проценты показываем только при известном
+    // направлении тока, иначе getBatteryLevel() врёт 100 %.
+    //
+    // Опрашиваем раз в секунду, а не каждый кадр: состояние заряда читается по
+    // I2C с INA226, а кадров при delay(10) около сотни в секунду. Заряд и
+    // разряд не меняются за десять миллисекунд, а шина нужна клавиатуре.
+    static unsigned long power_at_ms = 0;
+    static m5::charge_state_t power_state = m5::charge_state_t::not_initialized;
+    static int power_level = -1;
+
+    const unsigned long now = millis();
+    if (power_at_ms == 0 || now - power_at_ms >= 1000) {
+        power_at_ms = now;
+        power_state = M5.Power.getChargeState();
+        const bool battery_working =
+            power_state == m5::charge_state_t::charging || power_state == m5::charge_state_t::discharging;
+        power_level = battery_working ? M5.Power.getBatteryLevel() : -1;
+    }
+
+    s.charging = power_state == m5::charge_state_t::charging;
+    s.discharging = power_state == m5::charge_state_t::discharging;
+    s.battery_level = power_level;
+
+    const led::Colors c = led::compute(s);
+    g_keyboard.setLeds(c.model, c.power);
 }
 
 }  // namespace
@@ -641,6 +689,10 @@ void setup()
     const bool kbd_ok = g_keyboard.begin();
     if (kbd_ok) {
         logLine("Клавиатура: OK, прошивка v%u", g_keyboard.firmwareVersion());
+        // Заводская яркость светодиодов — 20; в тёмной комнате это заметно
+        // слепит, а смысла в яркой индикации нет: светодиоды тут для
+        // «взглянул и понял», а не для освещения. Половина от заводской.
+        g_keyboard.setLedBrightness(10);
     } else {
         logLine("Клавиатура: НЕ отвечает на адресе 0x%02X", cfg::kKeyboardAddr);
     }
@@ -678,9 +730,19 @@ void setup()
     const bool chats_ok = g_chat_store.begin();
     if (!chats_ok) logLine("Чат: хранилище тредов недоступно (SD?)");
 
-    g_chat_screen.init(g_api, g_chat_store, g_settings, g_wifi);
+    // Архив документов. Без него инструменты агента отвечают модели «архив
+    // недоступен» — это лучше, чем отключить инструменты целиком: модель
+    // скажет пользователю, в чём дело.
+    const bool notes_ok = g_doc_store.begin();
+    logLine("Архив: %s", notes_ok ? "готов" : "недоступен (SD?)");
+
+    g_chat_screen.init(g_api, g_chat_store, g_settings, g_wifi, g_doc_store);
     g_api_screen.init(g_settings, g_wifi);
     g_threads_screen.init(g_chat_store);
+    // Экран заметок получает ссылку на хранилище всегда, даже если архив не
+    // поднялся: ready() проверяется внутри, и экран покажет причину, а не
+    // пустоту вместо неё.
+    g_notes_screen.init(g_doc_store, g_settings);
 
     // Компактная строка состояния: подробности остались в Serial.
     snprintf(g_status, sizeof(g_status), "%s · SD %s%s · Wi-Fi %s · клав %s", power_status, sd_size,
@@ -728,6 +790,24 @@ void loop()
         // Общие команды проверяются до маршрутизации: они работают на любом
         // экране. Ctrl+W — Wi-Fi, Ctrl+A — настройки API, Ctrl+D — диагностика.
         if (ev.ctrl && ev.type == hw::KeyEvent::Type::Char) {
+            // Из редактора заметки уходить глобальными командами нельзя, пока
+            // есть несохранённый текст: уход молча выбросил бы правку (onExit
+            // её забывает), а пользователь ждал переключения экрана, а не
+            // потери работы. Esc в редакторе спрашивает подтверждение — он и
+            // остаётся способом выйти.
+            //
+            // Блокируются только команды СМЕНЫ ЭКРАНА. Проверять здесь любой
+            // Ctrl нельзя: сюда же приходят Ctrl+S и Ctrl+Z, и редактор не
+            // увидел бы их вовсе — сохранить заметку стало бы невозможно.
+            const bool nav = strcmp(ev.utf8, "w") == 0 || strcmp(ev.utf8, "ц") == 0 || strcmp(ev.utf8, "a") == 0 ||
+                             strcmp(ev.utf8, "ф") == 0 || strcmp(ev.utf8, "t") == 0 || strcmp(ev.utf8, "е") == 0 ||
+                             strcmp(ev.utf8, "o") == 0 || strcmp(ev.utf8, "щ") == 0 || strcmp(ev.utf8, "d") == 0 ||
+                             strcmp(ev.utf8, "в") == 0;
+            if (nav && g_screen == Screen::Notes && g_notes_screen.has_unsaved_edits()) {
+                g_notes_screen.notice("Есть несохранённые правки — Ctrl+S сохранить · Esc выйти");
+                continue;
+            }
+
             if (strcmp(ev.utf8, "w") == 0 || strcmp(ev.utf8, "ц") == 0) {
                 switch_screen(g_screen == Screen::Wifi ? Screen::Chat : Screen::Wifi);
                 continue;
@@ -739,6 +819,11 @@ void loop()
             // Ctrl+T — список тредов. «е» — та же клавиша в ЙЦУКЕН.
             if (strcmp(ev.utf8, "t") == 0 || strcmp(ev.utf8, "е") == 0) {
                 switch_screen(g_screen == Screen::Threads ? Screen::Chat : Screen::Threads);
+                continue;
+            }
+            // Ctrl+O — архив документов. «щ» — та же клавиша в ЙЦУКЕН.
+            if (strcmp(ev.utf8, "o") == 0 || strcmp(ev.utf8, "щ") == 0) {
+                switch_screen(g_screen == Screen::Notes ? Screen::Chat : Screen::Notes);
                 continue;
             }
             if (strcmp(ev.utf8, "d") == 0 || strcmp(ev.utf8, "в") == 0) {
@@ -784,6 +869,13 @@ void loop()
             if (want_close) switch_screen(Screen::Chat);
             continue;
         }
+        if (g_screen == Screen::Notes) {
+            // Экран правит документ сам, но не переключает себя: Esc в списке
+            // означает «в чат», и это решает main.
+            const bool want_close = g_notes_screen.onKey(ev);
+            if (want_close) switch_screen(Screen::Chat);
+            continue;
+        }
 
         // Ctrl+L - сбросить покрытие, чтобы пройти заново (диагностика).
         if (ev.ctrl && ev.type == hw::KeyEvent::Type::Char && strcmp(ev.utf8, "l") == 0) {
@@ -824,6 +916,7 @@ void loop()
     g_chat_screen.tick();
     g_api_screen.tick();
     hw::clock_sync::tick(g_wifi.connected());
+    update_leds();
 
     const auto& td = M5.Touch.getDetail();
 
@@ -853,6 +946,14 @@ void loop()
         if (td.wasReleased()) g_threads_screen.onTouch(td.x, td.y);
         open_thread_from_list();
         if (g_threads_screen.dirty()) g_threads_screen.draw();
+        delay(10);
+        return;
+    }
+
+    if (g_screen == Screen::Notes) {
+        g_notes_screen.tick();
+        if (td.wasReleased()) g_notes_screen.onTouch(td.x, td.y);
+        if (g_notes_screen.dirty()) g_notes_screen.draw();
         delay(10);
         return;
     }

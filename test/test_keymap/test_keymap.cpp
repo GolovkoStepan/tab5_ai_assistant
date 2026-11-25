@@ -100,9 +100,87 @@ void test_russian_punctuation_keeps_latin()
     TEST_ASSERT_EQUAL_UINT32(U'(', keymap::codepoint(1, 9, Layout::Russian, false, false));
     TEST_ASSERT_EQUAL_UINT32(U'\\', keymap::codepoint(1, 13, Layout::Russian, false, false));
 
-    // А точка и запятая — нет: на них в ЙЦУКЕН живут «ю» и «б».
+    // На клавише `.` в ЙЦУКЕН живёт «ю» — как на обычной клавиатуре.
     TEST_ASSERT_EQUAL_UINT32(U'.', keymap::codepoint(4, 9, Layout::Latin, false, false));
     TEST_ASSERT_EQUAL_UINT32(U'ю', keymap::codepoint(4, 9, Layout::Russian, false, false));
+}
+
+// --- Пунктуация и «б» в кириллице ---
+//
+// На A164 в нижнем ряду одна пунктуационная клавиша (`.`), а на обычной
+// клавиатуре их две: `,` и `/.`. В ЙЦУКЕН на них живут «б» и «ю/», поэтому
+// по-русски нельзя было поставить ни точку, ни запятую, а буквы «б» не было
+// вовсе. Потеря точки заметнее потери «б»: она нужна в каждом предложении.
+
+void test_russian_period_on_underscore_key()
+{
+    // Точка — на клавишу `_`: рука ищет её вслепую, через Sym каждый раз
+    // искать неудобно.
+    TEST_ASSERT_EQUAL_UINT32(U'.', keymap::codepoint(3, 12, Layout::Russian, false, false));
+    // С Aa — запятая, как Shift+`.` на обычной клавиатуре.
+    TEST_ASSERT_EQUAL_UINT32(U',', keymap::codepoint(3, 12, Layout::Russian, true, false));
+
+    // В латинице та же клавиша остаётся подчёркиванием: код и пути пишутся
+    // по-английски, и `snake_case` должен набираться.
+    TEST_ASSERT_EQUAL_UINT32(U'_', keymap::codepoint(3, 12, Layout::Latin, false, false));
+    TEST_ASSERT_EQUAL_UINT32(U'=', keymap::codepoint(3, 12, Layout::Latin, false, true));
+}
+
+void test_russian_letter_be_on_sym_underscore()
+{
+    TEST_ASSERT_EQUAL_UINT32(U'б', keymap::codepoint(3, 12, Layout::Russian, false, true));
+    // Заглавная тоже нужна: «Б» начинает предложения и имена.
+    TEST_ASSERT_EQUAL_UINT32(U'Б', keymap::codepoint(3, 12, Layout::Russian, true, true));
+}
+
+void test_comma_on_sym_dot()
+{
+    // Так же поступает и сама M5Stack в HID-таблицах этой клавиатуры:
+    // «Row 4 — Sym delta: . → ,».
+    TEST_ASSERT_EQUAL_UINT32(U',', keymap::codepoint(4, 9, Layout::Latin, false, true));
+    TEST_ASSERT_EQUAL_UINT32(U',', keymap::codepoint(4, 9, Layout::Russian, false, true));
+}
+
+void test_russian_alphabet_is_complete()
+{
+    // Ни один тест до этого не проверял, что все буквы доступны, — поэтому
+    // отсутствие «б» прожило до v0.2.0. Проверяем весь алфавит.
+    static const char32_t kAlphabet[] = U"абвгдеёжзийклмнопрстуфхцчшщъыьэюя";
+    for (size_t i = 0; kAlphabet[i] != 0; ++i) {
+        const char32_t want = kAlphabet[i];
+        bool found = false;
+        for (uint8_t row = 0; row < keymap::kRows && !found; ++row) {
+            for (uint8_t col = 0; col < keymap::kCols && !found; ++col) {
+                for (int shift = 0; shift <= 1 && !found; ++shift) {
+                    for (int sym = 0; sym <= 1 && !found; ++sym) {
+                        if (keymap::codepoint(row, col, Layout::Russian, shift != 0, sym != 0) == want) found = true;
+                    }
+                }
+            }
+        }
+        TEST_ASSERT_TRUE_MESSAGE(found, "буква недоступна в русской раскладке");
+    }
+}
+
+void test_russian_basic_punctuation_is_reachable()
+{
+    // Точка и запятая — минимум для связного текста. Остальная пунктуация
+    // (кавычки, тире) приходит от модели и в коде не набирается.
+    static const char32_t kNeeded[] = U".,";
+    for (size_t i = 0; kNeeded[i] != 0; ++i) {
+        const char32_t want = kNeeded[i];
+        bool found = false;
+        for (uint8_t row = 0; row < keymap::kRows && !found; ++row) {
+            for (uint8_t col = 0; col < keymap::kCols && !found; ++col) {
+                for (int shift = 0; shift <= 1 && !found; ++shift) {
+                    for (int sym = 0; sym <= 1 && !found; ++sym) {
+                        if (keymap::codepoint(row, col, Layout::Russian, shift != 0, sym != 0) == want) found = true;
+                    }
+                }
+            }
+        }
+        TEST_ASSERT_TRUE_MESSAGE(found, "знак недоступен в русской раскладке");
+    }
 }
 
 // --- Слой символов (Sym) ---
@@ -242,6 +320,11 @@ int main(int, char**)
     RUN_TEST(test_russian_yo);
     RUN_TEST(test_russian_shift);
     RUN_TEST(test_russian_punctuation_keeps_latin);
+    RUN_TEST(test_russian_period_on_underscore_key);
+    RUN_TEST(test_russian_letter_be_on_sym_underscore);
+    RUN_TEST(test_comma_on_sym_dot);
+    RUN_TEST(test_russian_alphabet_is_complete);
+    RUN_TEST(test_russian_basic_punctuation_is_reachable);
 
     RUN_TEST(test_sym_layer);
     RUN_TEST(test_sym_does_not_touch_letters);

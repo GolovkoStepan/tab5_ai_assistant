@@ -17,12 +17,12 @@
 #include <string.h>
 
 #include "app_config.h"
+#include "hw/clock.h"
 #include "ui/draw.h"
 #include "util/chat_history.h"
 #include "util/chat_measure.h"
 #include "util/chat_view.h"
 #include "util/format.h"
-#include "util/iso_time.h"
 
 namespace ui {
 namespace {
@@ -83,7 +83,12 @@ constexpr const char* kSystemPrompt =
     "Отвечай по-русски, кратко и по делу. Инструкции давай нумерованными шагами. "
     "Не выдумывай факты: если не уверен — прямо скажи об этом. "
     "Не используй эмодзи и другие пиктограммы: шрифт экрана их не поддерживает, "
-    "вместо них рисуются пустые квадраты.";
+    "вместо них рисуются пустые квадраты. "
+    "У тебя есть архив документов на устройстве (инструменты list_docs, read_doc, "
+    "search_docs, write_doc, delete_doc). Перед ответом на вопрос про бытовую технику, "
+    "настройки приборов или инструкции сначала поищи в архиве: возможно, ответ там уже "
+    "есть. Когда находишь решение, которое стоит запомнить, сохраняй его через write_doc: "
+    "заголовок по-русски, путь ASCII-слагом латиницей. Не удаляй документы без просьбы.";
 
 constexpr uint16_t kColorUser = TFT_CYAN;
 constexpr uint16_t kColorAssistant = 0x07E0;  // зелёный
@@ -109,6 +114,29 @@ uint16_t role_color(api::Role role, bool partial)
 {
     if (partial) return kColorPartial;
     return role == api::Role::User ? kColorUser : kColorAssistant;
+}
+
+/// Текст сообщения в том виде, в котором его видно в ленте.
+///
+/// Результат инструмента бывает на 4 КБ (документ целиком), и показывать его
+/// в ленте — значит утопить разговор: пользователь листал бы простыню
+/// markdown вместо своих вопросов. Показываем одну строку: имя инструмента и
+/// начало результата. Модели при этом уходит полный текст — в запрос он
+/// берётся из треда, а не отсюда.
+const char* shown_text(const hw::ChatMessage& m, char* buf, size_t cap)
+{
+    if (m.role != api::Role::Tool || m.content == nullptr) return m.content != nullptr ? m.content : "";
+
+    // Первая строка результата: для ответов вида «Создан документ home/x.md»
+    // это и есть весь смысл.
+    size_t n = 0;
+    while (m.content[n] != '\0' && m.content[n] != '\n' && m.content[n] != '\r' && n + 1 < cap)
+        ++n;
+
+    const int written = snprintf(buf, cap, "%s · %.*s%s", m.name[0] != '\0' ? m.name : "инструмент",
+        static_cast<int>(n), m.content, m.content[n] == '\0' ? "" : " …");
+    (void)written;
+    return buf;
 }
 
 bool is_char(const hw::KeyEvent& ev)
@@ -152,6 +180,7 @@ public:
     void on_finished(const char* reason) override { _screen->on_answer_finished(reason); }
     void on_retry(int attempt, int delay_s) override { _screen->on_answer_retry(attempt, delay_s); }
     void on_error(const char* message) override { _screen->on_answer_error(message); }
+    void on_tool_calls(const tools::Accumulator& calls) override { _screen->on_tool_calls(calls); }
 
 private:
     ChatScreen* _screen;
@@ -163,12 +192,14 @@ AnswerSink* g_sink = nullptr;
 
 // --- Жизненный цикл ---------------------------------------------------------
 
-void ChatScreen::init(hw::ApiClient& api, hw::ChatStore& store, hw::SettingsStore& settings, hw::WifiManager& wifi)
+void ChatScreen::init(
+    hw::ApiClient& api, hw::ChatStore& store, hw::SettingsStore& settings, hw::WifiManager& wifi, hw::DocStore& docs)
 {
     _api = &api;
     _store = &store;
     _settings = &settings;
     _wifi = &wifi;
+    _docs = &docs;
 
     // Тело запроса в PSRAM: история легко даёт десятки килобайт, а рядом с TLS
     // во внутренней RAM столько не найти.
@@ -181,11 +212,56 @@ void ChatScreen::init(hw::ApiClient& api, hw::ChatStore& store, hw::SettingsStor
     _line_counts = static_cast<uint16_t*>(calloc(hw::ChatStore::kMaxMessages, sizeof(uint16_t)));
 
     if (g_sink == nullptr) g_sink = new AnswerSink(this);
+
+    // --- Агент: инструменты архива -----------------------------------------
+    //
+    // Всё тяжёлое — в PSRAM. На стеке задачи интерфейса 8 КБ, а здесь только
+    // описания вызовов занимают 34 КБ (8 вызовов по 4 КБ аргументов).
+    _agent_calls = static_cast<tools::Accumulator*>(
+        static_cast<void*>(heap_caps_malloc(sizeof(tools::Accumulator), MALLOC_CAP_SPIRAM)));
+    if (_agent_calls == nullptr) _agent_calls = static_cast<tools::Accumulator*>(malloc(sizeof(tools::Accumulator)));
+    if (_agent_calls != nullptr) new (_agent_calls) tools::Accumulator();
+
+    _tools_json = static_cast<char*>(heap_caps_malloc(kToolsJsonCap, MALLOC_CAP_SPIRAM));
+    if (_tools_json == nullptr) _tools_json = static_cast<char*>(malloc(kToolsJsonCap));
+
+    _calls_json = static_cast<char*>(heap_caps_malloc(kCallsJsonCap, MALLOC_CAP_SPIRAM));
+    if (_calls_json == nullptr) _calls_json = static_cast<char*>(malloc(kCallsJsonCap));
+
+    _tool_out = static_cast<char*>(heap_caps_malloc(tools::kMaxResultBytes + 1, MALLOC_CAP_SPIRAM));
+    if (_tool_out == nullptr) _tool_out = static_cast<char*>(malloc(tools::kMaxResultBytes + 1));
+
+    _tool_body = static_cast<char*>(heap_caps_malloc(hw::DocStore::kMaxDocBytes + 1, MALLOC_CAP_SPIRAM));
+    if (_tool_body == nullptr) _tool_body = static_cast<char*>(malloc(hw::DocStore::kMaxDocBytes + 1));
+
+    _doc_entries = static_cast<docapi::Entry*>(
+        static_cast<void*>(heap_caps_malloc(docapi::kMaxListedDocs * sizeof(docapi::Entry), MALLOC_CAP_SPIRAM)));
+    if (_doc_entries == nullptr) {
+        _doc_entries = static_cast<docapi::Entry*>(malloc(docapi::kMaxListedDocs * sizeof(docapi::Entry)));
+    }
+
+    _doc_hits =
+        static_cast<docapi::Hit*>(static_cast<void*>(heap_caps_malloc(16 * sizeof(docapi::Hit), MALLOC_CAP_SPIRAM)));
+    if (_doc_hits == nullptr) _doc_hits = static_cast<docapi::Hit*>(malloc(16 * sizeof(docapi::Hit)));
+
+    doctools::register_all(_tools);
+    if (_tools_json != nullptr) {
+        if (!_tools.build_tools_json(_tools_json, kToolsJsonCap)) {
+            // Не влезли — работаем без инструментов: чат важнее агента, и
+            // молчаливое «модель не умеет искать» лучше, чем отказ экрана.
+            Serial.println("Агент: схемы инструментов не поместились, работаем без них");
+            _tools_json[0] = '\0';
+        } else {
+            Serial.printf(
+                "Агент: %u инструментов, схемы %u байт\n", (unsigned)_tools.count(), (unsigned)strlen(_tools_json));
+        }
+    }
 }
 
 void ChatScreen::onEnter()
 {
     _error[0] = '\0';
+    _failed = false;
 
     // Если запрос уже идёт (мы вернулись на экран из настроек), ничего не
     // перезагружаем: иначе ответ модели писался бы в чужой тред.
@@ -230,14 +306,14 @@ void ChatScreen::clear_thread(bool confirmed)
         // иначе пользователь жмёт второе Ctrl+R и ждёт, что что-то изменится.
         _store->clear(nullptr, 0);
         reset_after_thread_change();
-        fail("Тред и так пуст");
+        notice("Тред и так пуст");
         return;
     }
 
     if (!confirmed) {
         char msg[160];
         snprintf(msg, sizeof(msg), "Ctrl+R ещё раз — очистить тред и удалить %u сообщений с SD", (unsigned)n);
-        fail(msg);
+        notice(msg);
         _clear_armed = true;
         return;
     }
@@ -250,7 +326,7 @@ void ChatScreen::clear_thread(bool confirmed)
 
     Serial.printf("Чат: тред %s очищен\n", _store->slug());
     reset_after_thread_change();
-    fail("Тред очищен");
+    notice("Тред очищен");
 }
 
 void ChatScreen::new_thread()
@@ -274,7 +350,7 @@ bool ChatScreen::open_thread(const char* slug)
     // Идёт ответ — переключать тред нельзя: недописанный ответ прилип бы к
     // чужому разговору. Тот же запрет, что у Ctrl+N.
     if (_mode != Mode::Idle) {
-        fail("Дождитесь ответа или нажмите Esc");
+        notice("Дождитесь ответа или нажмите Esc");
         return false;
     }
 
@@ -310,6 +386,7 @@ void ChatScreen::reset_after_thread_change()
     // прокрутка и измерения относятся к прежнему содержимому. Разъедутся —
     // получится тред из одного файла, а лента из другого.
     _error[0] = '\0';
+    _failed = false;
     _scroll = 0;
     _input[0] = '\0';
     _input_len = 0;
@@ -348,7 +425,27 @@ void ChatScreen::enter_mode(Mode m)
 void ChatScreen::fail(const char* text)
 {
     snprintf(_error, sizeof(_error), "%s", text);
+    _failed = true;
     _redraw_error = true;
+}
+
+void ChatScreen::notice(const char* text)
+{
+    snprintf(_error, sizeof(_error), "%s", text);
+    _failed = false;
+    _redraw_error = true;
+}
+
+void ChatScreen::fill_model_status(led::Status& s) const
+{
+    // Подтверждение — не «модель работает»: светодиод не должен гореть синим,
+    // пока ждём решения человека.
+    s.busy = _mode == Mode::Sending || _mode == Mode::Streaming;
+    s.streaming = _mode == Mode::Streaming;
+    // Пауза перед повтором: счётчик уже сброшен при выходе из Sending, но
+    // пока идёт обратный отсчёт, режим всё ещё Sending.
+    s.retrying = _mode == Mode::Sending && _retry_delay_s > 0;
+    s.error = _failed;
 }
 
 // --- Клавиатура -------------------------------------------------------------
@@ -367,7 +464,7 @@ bool ChatScreen::onKey(const hw::KeyEvent& ev)
         if (_mode == Mode::Idle) {
             new_thread();
         } else {
-            fail("Дождитесь ответа или нажмите Esc");
+            notice("Дождитесь ответа или нажмите Esc");
         }
         return false;
     }
@@ -378,10 +475,22 @@ bool ChatScreen::onKey(const hw::KeyEvent& ev)
     // чистит.
     if (ev.ctrl && is_char(ev) && (strcmp(ev.utf8, "r") == 0 || strcmp(ev.utf8, "к") == 0)) {
         if (_mode != Mode::Idle) {
-            fail("Дождитесь ответа или нажмите Esc");
+            notice("Дождитесь ответа или нажмите Esc");
             return false;
         }
         clear_thread(clear_was_armed);
+        return false;
+    }
+
+    // Подтверждение удаления агентом: Enter — удалить, Esc — отклонить. Всё
+    // остальное игнорируется: вопрос необратимый, и случайная клавиша не
+    // должна ни удалить файл, ни оставить агента без ответа.
+    if (_mode == Mode::Confirming) {
+        if (ev.type == hw::KeyEvent::Type::Special && ev.special == keymap::Special::Enter) {
+            resolve_delete(true);
+        } else if (ev.type == hw::KeyEvent::Type::Special && ev.special == keymap::Special::Escape) {
+            resolve_delete(false);
+        }
         return false;
     }
 
@@ -394,12 +503,54 @@ bool ChatScreen::onKey(const hw::KeyEvent& ev)
             const hw::ChatMessage* last = _store->last();
             const bool had_text = last != nullptr && last->content_len > 0;
 
+            // Цикл агента обрываем вместе с запросом: иначе после Esc он
+            // продолжил бы выполнять инструменты и писать в тред результаты,
+            // которых пользователь уже не ждёт.
+            //
+            // Ходом агента считаем не только «выполняется вызов»
+            // (_agent_pending), но и «ждём ответа на шаг» (_agent_step > 0):
+            // иначе Esc на запросе после инструментов увёл бы ход в
+            // restore_unsent_question(), а откатывать там нечего — вопрос
+            // пользователя давно в середине треда, и последним лежит
+            // результат инструмента. Получилось бы «вопрос остался без
+            // ответа» на ровном месте.
+            const bool agent_turn = _agent_pending || _agent_step > 0;
+            _have_calls = false;
+            _turn_ended = false;
+            _agent_pending = false;
+            _confirm_index = static_cast<size_t>(-1);
+
+            if (agent_turn) {
+                const hw::ChatMessage* last = _store->last();
+                const bool has_text = last != nullptr && last->role == api::Role::Assistant && last->content_len > 0;
+
+                if (_api != nullptr && _api->busy()) _api->cancel();
+
+                if (has_text) {
+                    // Модель успела что-то сказать — текст сохраняем, как и в
+                    // обычном ответе, с пометкой неполного.
+                    _answer.partial = true;
+                    finish_answer(true, nullptr);
+                    notice("Ответ прерван, сохранён неполным");
+                    return false;
+                }
+
+                // Незавершённая пустая реплика модели осталась бы в ленте
+                // подписью «модель» без текста. Убираем её.
+                if (last != nullptr && last->role == api::Role::Assistant) _store->drop_last();
+                enter_mode(Mode::Idle);
+                notice("Агент прерван, выполненные шаги сохранены");
+                _redraw_feed = true;
+                _redraw_status = true;
+                return false;
+            }
+
             _answer.partial = true;
             if (_api != nullptr) _api->cancel();
             finish_answer(true, "cancel");
 
             if (had_text) {
-                fail("Ответ прерван, сохранён неполным");
+                notice("Ответ прерван, сохранён неполным");
             } else {
                 // Ответа не было вовсе. В треде остался вопрос без ответа, и
                 // следующий ответ модели прилип бы к нему — в ленте вышло бы
@@ -496,7 +647,7 @@ void ChatScreen::handle_typing_key(const hw::KeyEvent& ev)
 
     const size_t n = strlen(ev.utf8);
     if (_input_len + n >= sizeof(_input)) {
-        fail("Вопрос слишком длинный");
+        notice("Вопрос слишком длинный");
         return;
     }
 
@@ -505,6 +656,7 @@ void ChatScreen::handle_typing_key(const hw::KeyEvent& ev)
     _input[_input_len] = '\0';
 
     _error[0] = '\0';
+    _failed = false;
     _redraw_error = true;
     _redraw_input = true;
 }
@@ -548,7 +700,7 @@ bool ChatScreen::send_question()
 {
     if (_mode != Mode::Idle) return false;
     if (_input_len == 0) {
-        fail("Введите вопрос");
+        notice("Введите вопрос");
         return false;
     }
     if (_wifi == nullptr || !_wifi->connected()) {
@@ -590,6 +742,13 @@ bool ChatScreen::send_question()
     _abort_overflow = false;
     _retry_attempt = 0;
     _retry_delay_s = 0;
+    _agent_step = 0;
+    _agent_call_index = 0;
+    _agent_pending = false;
+    _have_calls = false;
+    _turn_ended = false;
+    _confirm_index = static_cast<size_t>(-1);
+    _dsml.reset();
 
     const size_t body_len = build_body();
     if (body_len == 0) {
@@ -608,6 +767,7 @@ bool ChatScreen::send_question()
     }
 
     _error[0] = '\0';
+    _failed = false;
     _redraw_error = true;
     _scroll = 0;
     // Заголовок треда — это первое сообщение пользователя. Пока оно не было
@@ -632,8 +792,9 @@ size_t ChatScreen::build_body()
         g_hist[i].role = m.role;
         g_hist[i].content = m.content;
         g_hist[i].content_len = m.content_len;
-        g_hist[i].tool_call_id = nullptr;
-        g_hist[i].name = nullptr;
+        g_hist[i].tool_call_id = m.tool_call_id[0] != '\0' ? m.tool_call_id : nullptr;
+        g_hist[i].name = m.name[0] != '\0' ? m.name : nullptr;
+        g_hist[i].tool_calls = m.tool_calls;
     }
 
     const history::TrimResult trim = history::trim(g_hist, usable, kHistoryBudgetBytes);
@@ -643,6 +804,7 @@ size_t ChatScreen::build_body()
     g_out[n].content = kSystemPrompt;
     g_out[n].tool_call_id = nullptr;
     g_out[n].name = nullptr;
+    g_out[n].tool_calls_json = nullptr;
     ++n;
 
     for (size_t i = trim.begin; i < trim.end; ++i) {
@@ -650,6 +812,7 @@ size_t ChatScreen::build_body()
         g_out[n].content = g_hist[i].content;
         g_out[n].tool_call_id = g_hist[i].tool_call_id;
         g_out[n].name = g_hist[i].name;
+        g_out[n].tool_calls_json = g_hist[i].tool_calls;
         ++n;
     }
 
@@ -666,6 +829,10 @@ size_t ChatScreen::build_body()
     // экономит выходные токены, за которые платим.
     static const char* const kEffort[] = {"none", "low", "medium", "high"};
     opt.reasoning_effort = kEffort[cfg.reasoning_effort <= 3 ? cfg.reasoning_effort : 1];
+
+    // tools — в КАЖДОМ запросе, включая ходы с результатами инструментов: без
+    // них модель иногда печатает внутреннюю разметку в текст (Р-025).
+    opt.tools_json = (_tools_json != nullptr && _tools_json[0] != '\0') ? _tools_json : nullptr;
 
     return api::build_request(g_out, n, opt, _body, kBodyCap);
 }
@@ -714,7 +881,7 @@ void ChatScreen::restore_unsent_question()
         _redraw_input = true;
     }
 
-    fail("Запрос отменён до первого слова, вопрос вернулся в поле ввода");
+    notice("Запрос отменён до первого слова, вопрос вернулся в поле ввода");
     _redraw_feed = true;
     _redraw_title = true;
     _scroll = 0;
@@ -733,7 +900,7 @@ void ChatScreen::finish_answer(bool ok, const char* reason)
         if (!ok) {
             fail(reason != nullptr ? reason : "Модель не ответила");
         } else if (reason != nullptr && strcmp(reason, "cancel") == 0) {
-            fail("Запрос отменён до первого слова");
+            notice("Запрос отменён до первого слова");
         } else {
             fail("Модель вернула пустой ответ");
         }
@@ -766,12 +933,307 @@ void ChatScreen::finish_answer(bool ok, const char* reason)
     if (!ok) {
         fail(reason != nullptr ? reason : "Ответ оборван");
     } else if (reason != nullptr && strcmp(reason, "length") == 0) {
-        fail("Ответ обрезан лимитом токенов модели");
+        notice("Ответ обрезан лимитом токенов модели");
     }
 
     enter_mode(Mode::Idle);
     _redraw_feed = true;
     _redraw_status = true;
+}
+
+// --- Агентский цикл ---------------------------------------------------------
+//
+// Модель вместо текста просит инструменты. Ход тогда не заканчивается: её
+// сообщение с вызовами попадает в тред, каждый вызов выполняется, результат
+// уходит обратно как role=tool, и отправляется следующий запрос. До
+// cfg::kMaxAgentSteps шагов.
+//
+// Почему ОДИН вызов за кадр, а не все сразу. Инструмент работает с SD: список
+// читает заголовки шестидесяти документов, поиск — их тела. Восемь вызовов
+// подряд дали бы секунды, в течение которых Esc не обрабатывался бы, — а
+// агент как раз тот случай, когда пользователь хочет прервать. Поэтому шаг
+// разложен по tick(): вызов, кадр, следующий вызов.
+
+void ChatScreen::handle_turn_end()
+{
+    _turn_ended = false;
+
+    // Фильтр держал хвост, который мог оказаться началом маркера. Поток
+    // кончился — если это не маркер, хвост надо дописать, иначе последние
+    // 1–12 байт ответа пропадут.
+    const size_t tail = _dsml.flush(_dsml_buf, sizeof(_dsml_buf));
+    if (tail > 0 && _turn_ok) {
+        append_answer(_dsml_buf, tail);
+        if (_scroll == 0) _redraw_feed = true;
+    }
+
+    // Пришёл ответ с вызовами: ход продолжается, а не заканчивается.
+    if (_have_calls && _turn_ok) {
+        _have_calls = false;
+
+        if (_agent_calls == nullptr) {
+            finish_answer(false, "не хватило памяти на разбор вызовов инструментов");
+            return;
+        }
+
+        // Лимит шагов. Дописываем причину в саму реплику: пустую реплику
+        // finish_answer() выбросил бы как «модель не ответила», а пользователю
+        // нужен видимый след — он ждал результата.
+        if (_agent_step >= cfg::kMaxAgentSteps) {
+            const char* text = "Остановился: сделано 8 шагов. Уточните вопрос.";
+            append_answer(text, strlen(text));
+            finish_answer(true, nullptr);
+            notice("Агент остановлен: лимит 8 шагов");
+            return;
+        }
+
+        ++_agent_step;
+
+        // Сообщение модели с вызовами: текст мог быть пустым, но массив
+        // вызовов обязателен. Без него сервер не свяжет результаты role=tool.
+        if (_calls_json != nullptr) tools::build_calls_json(*_agent_calls, _calls_json, kCallsJsonCap);
+        if (_calls_json != nullptr && _calls_json[0] != '\0') {
+            _store->set_last_tool_calls(_calls_json);
+
+            // Это сообщение только что стало «служебным ходом» (текст пуст,
+            // вызовы есть) и должно исчезнуть из ленты. Кэш строк об этом не
+            // узнает сам: длина ТЕКСТА не изменилась, а решение «скрыть»
+            // зависит ещё и от tool_calls_len.
+            remeasure_last();
+            _redraw_feed = true;
+        }
+
+        char ts[32];
+        now_iso(ts, sizeof(ts));
+        _store->finish_last(ts[0] != '\0' ? ts : nullptr, _answer.input_tokens, _answer.output_tokens, false);
+
+        char err[96];
+        if (!_store->flush_last(err, sizeof(err))) {
+            finish_answer(false, err[0] != '\0' ? err : "не удалось записать вызовы в тред");
+            return;
+        }
+
+        _agent_call_index = 0;
+        _agent_pending = true;
+        _redraw_feed = true;
+
+        // Режим «агент работает»: в статусе будет видно шаг, а поле ввода
+        // скажет ждать. Сам вызов выполнится в следующих кадрах.
+        enter_mode(Mode::Sending);
+        return;
+    }
+
+    _have_calls = false;
+    finish_answer(_turn_ok, _turn_reason);
+}
+
+bool ChatScreen::step_agent()
+{
+    if (_agent_calls == nullptr) return false;
+
+    if (_agent_call_index >= _agent_calls->count()) {
+        _agent_pending = false;
+        return send_agent_turn();
+    }
+
+    const tools::Call& call = _agent_calls->at(_agent_call_index);
+    execute_call(call);
+    // Обработчик попросил подтверждения: удаление необратимо, решает
+    // пользователь. Индекс не двигаем — вызов повторится с флагом, когда
+    // человек ответит.
+    //
+    // _agent_pending снимаем: иначе tick() вызывал бы step_agent() каждый кадр,
+    // и delete_doc переспрашивал бы существование файла по SD 60 раз в секунду.
+    // Взведёт флаг обратно resolve_delete().
+    if (_confirm_index != static_cast<size_t>(-1)) {
+        _agent_pending = false;
+        enter_mode(Mode::Confirming);
+        char msg[200];
+        snprintf(msg, sizeof(msg), "Агент просит удалить %s · Enter — удалить, Esc — отмена", _confirm_path);
+        notice(msg);
+        return false;
+    }
+
+    // answer_call() мог не суметь записать результат (арена, файл) и уже
+    // закрыть ход. Тогда цикл останавливаем: следующий запрос ушёл бы без
+    // ответа на вызов, и модель запуталась бы.
+    if (_mode == Mode::Idle) {
+        _agent_pending = false;
+        return false;
+    }
+
+    ++_agent_call_index;
+    return true;
+}
+
+void ChatScreen::execute_call(const tools::Call& call)
+{
+    // Буферы собираются заново на каждый вызов: обработчик не должен видеть
+    // остатки предыдущего результата.
+    _tool_ctx = tools::Context{};
+
+    // Неготовый архив — nullptr, а не пустое хранилище: иначе list_docs
+    // ответил бы «архив пуст», и модель сказала бы пользователю, что документов
+    // нет, хотя на самом деле нет SD-карты.
+    _tool_ctx.store = (_docs != nullptr && _docs->ready()) ? static_cast<docapi::Store*>(_docs) : nullptr;
+    _tool_ctx.out = _tool_out;
+    _tool_ctx.out_cap = tools::kMaxResultBytes + 1;
+    _tool_ctx.body = _tool_body;
+    _tool_ctx.body_cap = hw::DocStore::kMaxDocBytes + 1;
+    _tool_ctx.entries = _doc_entries;
+    _tool_ctx.entries_cap = docapi::kMaxListedDocs;
+    _tool_ctx.hits = _doc_hits;
+    _tool_ctx.hits_cap = 16;
+    _tool_ctx.confirmed = false;
+
+    char ts[32];
+    now_iso(ts, sizeof(ts));
+    _tool_ctx.now_iso = ts[0] != '\0' ? ts : nullptr;
+
+    if (_tool_out == nullptr) {
+        answer_call(call, "Ошибка: не хватило памяти под результат инструмента");
+        return;
+    }
+
+    // Пустые аргументы сервер присылает как "" — инструменту нужен хотя бы
+    // пустой объект, иначе валидация решит, что аргументов нет вовсе.
+    const char* args = call.arguments_len > 0 ? call.arguments : "{}";
+    _tools.invoke(call.name, args, strlen(args), _tool_ctx);
+
+    // Обработчик попросил подтверждения — ответ пока не отправляем, его даст
+    // resolve_delete().
+    if (_tool_ctx.deferred && _tool_ctx.needs_confirm) {
+        _confirm_index = _agent_call_index;
+        snprintf(_confirm_path, sizeof(_confirm_path), "%s", _tool_ctx.confirm_path);
+        return;
+    }
+
+    answer_call(call, _tool_out);
+}
+
+/// Инструменты, после которых содержимое архива меняется и индекс устаревает.
+bool changes_archive(const char* name)
+{
+    return name != nullptr && (strcmp(name, "write_doc") == 0 || strcmp(name, "delete_doc") == 0);
+}
+
+void ChatScreen::answer_call(const tools::Call& call, const char* text)
+{
+    char id[tools::Call::kFallbackIdLen];
+    tools::effective_id(call, id, sizeof(id));
+
+    char ts[32];
+    now_iso(ts, sizeof(ts));
+
+    char err[96];
+    if (!_store->append(api::Role::Tool, text != nullptr ? text : "", ts[0] != '\0' ? ts : nullptr, 0, 0, err,
+            sizeof(err), id, call.name)) {
+        // Не записалось — сообщать модели нечего: следующий запрос ушёл бы без
+        // результата, и она в лучшем случае переспросила. Честнее сказать
+        // пользователю, что тред переполнен.
+        finish_answer(false, err[0] != '\0' ? err : "не удалось записать результат инструмента");
+        return;
+    }
+
+    // Индекс пересобираем сразу после изменения архива, а не при выходе из
+    // чата: пользователь может открыть карту на компьютере или посмотреть
+    // notes/INDEX.md на самом устройстве, и устаревший список читался бы как
+    // «документ не сохранился».
+    if (changes_archive(call.name) && text != nullptr && strncmp(text, "Ошибка", 6) != 0 && _docs != nullptr) {
+        char idx_err[96];
+        if (!_docs->rebuild_index(idx_err, sizeof(idx_err))) {
+            // Не ошибка диалога: документ записан, пострадал только индекс.
+            Serial.printf("Архив: индекс не пересобрался — %s\n", idx_err);
+        }
+    }
+
+    _redraw_feed = true;
+    _redraw_title = true;
+}
+
+bool ChatScreen::send_agent_turn()
+{
+    _answer.input_tokens = 0;
+    _answer.output_tokens = 0;
+    _answer.partial = false;
+    _retry_attempt = 0;
+    _retry_delay_s = 0;
+    _dsml.reset();
+
+    char err[128];
+    if (!_store->begin_answer(err, sizeof(err))) {
+        finish_answer(false, err[0] != '\0' ? err : "тред переполнен, начните новый");
+        return false;
+    }
+
+    const size_t body_len = build_body();
+    if (body_len == 0) {
+        _store->drop_last();
+        finish_answer(false, "история не собралась в запрос");
+        return false;
+    }
+
+    if (!_api->start(_settings->config().api_base_url, _settings->secrets().api_key, _body, g_sink, err, sizeof(err))) {
+        _store->drop_last();
+        finish_answer(false, err[0] != '\0' ? err : "не удалось отправить запрос");
+        return false;
+    }
+
+    enter_mode(Mode::Sending);
+    _scroll = 0;
+    return true;
+}
+
+void ChatScreen::resolve_delete(bool confirmed)
+{
+    if (_confirm_index == static_cast<size_t>(-1) || _agent_calls == nullptr) {
+        // Подтверждать нечего: скорее всего Esc уже прервал ход. Возвращаем
+        // экран в покой, а не в «отправляю» — отправлять нечего.
+        enter_mode(Mode::Idle);
+        return;
+    }
+
+    const size_t idx = _confirm_index;
+    _confirm_index = static_cast<size_t>(-1);
+
+    const tools::Call& call = _agent_calls->at(idx);
+
+    if (!confirmed) {
+        // Отказ: модели надо ответить, что удаление отклонено. Иначе она
+        // повторит вызов, и пользователя будут спрашивать снова.
+        answer_call(call, "Пользователь отклонил удаление документа");
+    } else {
+        // Подтверждение: повторяем вызов с флагом. Решение пользователя — не
+        // аргумент модели, поэтому передаём его в контексте.
+        _tool_ctx = tools::Context{};
+        _tool_ctx.store = (_docs != nullptr && _docs->ready()) ? static_cast<docapi::Store*>(_docs) : nullptr;
+        _tool_ctx.out = _tool_out;
+        _tool_ctx.out_cap = tools::kMaxResultBytes + 1;
+        _tool_ctx.body = _tool_body;
+        _tool_ctx.body_cap = hw::DocStore::kMaxDocBytes + 1;
+        _tool_ctx.entries = _doc_entries;
+        _tool_ctx.entries_cap = docapi::kMaxListedDocs;
+        _tool_ctx.hits = _doc_hits;
+        _tool_ctx.hits_cap = 16;
+        _tool_ctx.confirmed = true;
+
+        char ts[32];
+        now_iso(ts, sizeof(ts));
+        _tool_ctx.now_iso = ts[0] != '\0' ? ts : nullptr;
+
+        const char* args = call.arguments_len > 0 ? call.arguments : "{}";
+        _tools.invoke(call.name, args, strlen(args), _tool_ctx);
+        answer_call(call, _tool_out);
+    }
+
+    if (_mode == Mode::Idle) {
+        _agent_pending = false;
+        return;
+    }
+
+    _agent_call_index = idx + 1;
+    enter_mode(Mode::Sending);
+    _agent_pending = true;
 }
 
 // --- Периодика --------------------------------------------------------------
@@ -794,7 +1256,7 @@ void ChatScreen::tick()
             _answer.partial = true;
             _api->cancel();
             finish_answer(true, nullptr);
-            fail("Ответ длиннее 12 КБ — сохранён неполным");
+            notice("Ответ длиннее 12 КБ — сохранён неполным");
         }
         return;
     }
@@ -815,6 +1277,21 @@ void ChatScreen::tick()
     if (strcmp(net_now, _net_cache) != 0) {
         snprintf(_net_cache, sizeof(_net_cache), "%s", net_now);
         _redraw_title = true;
+    }
+
+    // Ход закончился: либо закрываем ответ, либо идём на следующий шаг агента.
+    // Делаем это здесь, а не в обработчике потока: start() нового запроса
+    // внутри on_finished() переинициализировал бы парсер под работающим feed().
+    if (_turn_ended) {
+        handle_turn_end();
+        if (_mode == Mode::Idle) return;
+    }
+
+    // Агент выполняет ровно один инструмент за кадр: вызовы работают с SD, и
+    // все сразу заморозили бы экран на секунды. Остальные — в следующих кадрах.
+    if (_agent_pending) {
+        step_agent();
+        if (_mode == Mode::Idle) return;
     }
 
     if (_mode == Mode::Idle) return;
@@ -851,7 +1328,15 @@ bool ChatScreen::dirty() const
 
 void ChatScreen::on_answer_text(const char* text, size_t len)
 {
-    const bool appended = append_answer(text, len);
+    if (text == nullptr || len == 0) return;
+    // Внутренняя разметка DSML: модель иногда печатает её в текст вместо
+    // вызова инструмента (Р-025). Фильтр режет её вместе со всем, что после
+    // маркера, и режет с учётом границы чанков.
+    if (len > sizeof(_dsml_buf)) len = sizeof(_dsml_buf);
+    len = _dsml.feed(text, len, _dsml_buf, sizeof(_dsml_buf));
+    if (len == 0) return;
+
+    const bool appended = append_answer(_dsml_buf, len);
 
     if (_mode == Mode::Sending) enter_mode(Mode::Streaming);
 
@@ -890,12 +1375,26 @@ void ChatScreen::on_answer_usage(long input_tokens, long output_tokens)
 
 void ChatScreen::on_answer_finished(const char* reason)
 {
-    finish_answer(true, reason);
+    // Не finish_answer() сразу: здесь могут быть вызовы инструментов, и тогда
+    // ход продолжается. Решение принимает tick() — start() нового запроса
+    // внутри обработчика потока переинициализировал бы парсер под feed().
+    snprintf(_turn_reason, sizeof(_turn_reason), "%s", reason != nullptr ? reason : "stop");
+    _turn_ok = true;
+    _turn_ended = true;
 }
 
 void ChatScreen::on_answer_error(const char* message)
 {
-    finish_answer(false, message);
+    snprintf(_turn_reason, sizeof(_turn_reason), "%s", message != nullptr ? message : "ошибка");
+    _turn_ok = false;
+    _turn_ended = true;
+}
+
+void ChatScreen::on_tool_calls(const tools::Accumulator& calls)
+{
+    if (_agent_calls == nullptr) return;
+    *_agent_calls = calls;
+    _have_calls = _agent_calls->any();
 }
 
 void ChatScreen::on_answer_retry(int attempt, int delay_s)
@@ -958,6 +1457,14 @@ size_t ChatScreen::visible_lines() const
     return chatview::lines_per_page(kFeedH, kLineH);
 }
 
+void ChatScreen::remeasure_last()
+{
+    // Счётчик отодвигаем на единицу назад: measure_messages() пересчитает всё
+    // начиная с этого индекса, то есть ровно последнее сообщение.
+    if (_measured_count > 0) --_measured_count;
+    _feed_valid = false;
+}
+
 void ChatScreen::invalidate_measure()
 {
     _measured_count = 0;
@@ -998,7 +1505,19 @@ void ChatScreen::measure_messages()
 
     for (size_t i = start; i < count; ++i) {
         const hw::ChatMessage& m = _store->at(i);
-        size_t lines = kLabelLines + count_lines(m.content, width);
+
+        // Служебный ход модели (пустой текст, только вызовы инструментов) в
+        // ленте не виден: 0 строк. Пишется он ради протокола — без него сервер
+        // не свяжет ответы role=tool с вызовами, — но показать под ним нечего.
+        // Ноль здесь, а не «пропустить при отрисовке»: измерение и отрисовка
+        // должны пользоваться одним правилом, иначе окно ленты разъедется с
+        // содержимым.
+        if (chatview::service_turn(m.content_len, m.tool_calls_len)) {
+            _line_counts[i] = 0;
+            continue;
+        }
+
+        size_t lines = kLabelLines + count_lines(shown_text(m, g_line_buf, sizeof(g_line_buf)), width);
         if (lines > kMaxLinesPerMessage) lines = kMaxLinesPerMessage;
         _line_counts[i] = static_cast<uint16_t>(lines);
     }
@@ -1015,31 +1534,12 @@ void ChatScreen::now_iso(char* out, size_t out_len) const
 {
     if (out == nullptr || out_len == 0) return;
     out[0] = '\0';
+    if (_settings == nullptr) return;
 
-    // Время берём из системных часов, а не из RTC напрямую: их выставляет
-    // hw/clock_sync по NTP, и на незаряженном суперконденсаторе RTC может
-    // отдавать мусор, пока сеть не поднялась. Если время ещё не осмысленное,
-    // метки не будет вовсе — пустая строка честнее «1970-01-01».
-    const time_t now = time(nullptr);
-    struct tm t{};
-    localtime_r(&now, &t);
-
-    if (!isotime::is_valid(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec)) {
-        return;
-    }
-
-    // Смещение уже учтено localtime_r: TZ выставлена из настроек в
-    // clock_sync::begin(). Осталось только записать его явно, чтобы тред,
-    // открытый в другом поясе, показывал верное время.
-    int tz_minutes = 0;
-    if (_settings == nullptr || !isotime::parse_tz_offset(_settings->config().timezone, &tz_minutes)) {
-        tz_minutes = 0;
-    }
-
-    isotime::format_iso8601(
-        out, out_len, t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, tz_minutes);
+    // Вся логика времени — в hw/clock: треды, документы и заметки должны
+    // получать метки одинаково. Здесь только источник настроек.
+    hw::clock_sync::now_iso(_settings->config(), out, out_len);
 }
-
 // --- Отрисовка --------------------------------------------------------------
 
 void ChatScreen::draw()
@@ -1289,12 +1789,24 @@ void ChatScreen::paint_feed(const chatview::Window& win, int band_top, int band_
 
     int drawn = 0;
 
-    for (size_t i = static_cast<size_t>(win.first_msg); i < count && static_cast<size_t>(drawn) < win.visible_count;
-        ++i, ++drawn) {
+    // Границу проверяем в теле, а не в заголовке цикла: служебные ходы модели
+    // занимают 0 строк и не считаются нарисованными, а счётчик в условии после
+    // такого пропуска ушёл бы в минус.
+    for (size_t i = static_cast<size_t>(win.first_msg); i < count; ++i) {
+        if (static_cast<size_t>(drawn) >= win.visible_count) break;
+
         const hw::ChatMessage& m = _store->at(i);
 
+        // Служебный ход модели с вызовами занимает 0 строк (см. measure_messages):
+        // рисовать нечего, и место следующего сообщения он не съедает.
+        if (chatview::service_turn(m.content_len, m.tool_calls_len)) continue;
+
         const uint16_t color = role_color(m.role, m.partial);
-        const size_t lines = split_lines(m.content, width, g_offsets, kMaxLinesPerMessage);
+
+        // У результатов инструмента в ленте только одна строка — см. shown_text().
+        char shown_buf[sizeof(g_line_buf)];
+        const char* body = shown_text(m, shown_buf, sizeof(shown_buf));
+        const size_t lines = split_lines(body, width, g_offsets, kMaxLinesPerMessage);
 
         // Подпись роли — строка 0 сообщения, текст начинается со строки 1.
         const size_t first_text_line = (i == static_cast<size_t>(win.first_msg)) ? win.first_line : 0;
@@ -1317,10 +1829,10 @@ void ChatScreen::paint_feed(const chatview::Window& win, int band_top, int band_
 
             if (y + kLineH > band_top && y < band_bottom) {
                 const size_t begin = g_offsets[ln];
-                const size_t end = (ln + 1 < lines) ? g_offsets[ln + 1] : strlen(m.content);
+                const size_t end = (ln + 1 < lines) ? g_offsets[ln + 1] : strlen(body);
 
                 size_t len = end > begin ? end - begin : 0;
-                const char* p = m.content + begin;
+                const char* p = body + begin;
 
                 // Переводы строк вырезаем: их уже учёл перенос.
                 while (len > 0 && (p[len - 1] == '\n' || p[len - 1] == '\r'))
@@ -1342,6 +1854,7 @@ void ChatScreen::paint_feed(const chatview::Window& win, int band_top, int band_
         }
 
         if (y >= feed_bottom) break;
+        ++drawn;
     }
 
     // Остаток снизу: 510 не делится на 22 без остатка, и без этой заливки
@@ -1382,6 +1895,8 @@ void ChatScreen::draw_input_field()
     if (_input_len == 0) {
         if (_mode == Mode::Idle) {
             ui::text("Вопрос…", text_x, text_y, kColorFaint);
+        } else if (_mode == Mode::Confirming) {
+            ui::text("Подтвердите удаление: Enter или Esc", text_x, text_y, kColorPartial);
         } else {
             ui::text("Ждите ответа · Esc — прервать", text_x, text_y, kColorFaint);
         }
@@ -1444,10 +1959,16 @@ void ChatScreen::draw_status()
         // reasoning_effort первый текст приходит через полторы секунды.
         static const char* const kDots[] = {"", ".", "..", "..."};
         const int d = _dots >= 0 && _dots <= 3 ? _dots : 0;
-        snprintf(left, sizeof(left), "думаю%s  %d с", kDots[d], _wait_sec > 0 ? _wait_sec : 0);
+        if (_agent_step > 0) {
+            snprintf(
+                left, sizeof(left), "агент · шаг %d%s  %d с", _agent_step, kDots[d], _wait_sec > 0 ? _wait_sec : 0);
+        } else {
+            snprintf(left, sizeof(left), "думаю%s  %d с", kDots[d], _wait_sec > 0 ? _wait_sec : 0);
+        }
         break;
     }
     case Mode::Streaming: snprintf(left, sizeof(left), "печатает…  %d с", _wait_sec > 0 ? _wait_sec : 0); break;
+    case Mode::Confirming: snprintf(left, sizeof(left), "ждёт подтверждения"); break;
     }
 
     if (left[0] != '\0') ui::text(left, kMarginX, kStatusY, kColorAssistant);
@@ -1487,7 +2008,12 @@ void ChatScreen::draw_hints()
     //
     // «Esc — очистить ввод» сказано полностью: рядом появился Ctrl+R со
     // словом «сброс», и голое «Esc — очистить» читалось бы как то же самое.
-    ui::text("Enter — отправить · Esc — очистить ввод · ↑↓ — прокрутка", kMarginX, kHintY, kColorFaint);
+    if (_mode == Mode::Confirming) {
+        ui::text("Удаление необратимо · Enter — удалить · Esc — отмена", kMarginX, kHintY, kColorPartial);
+        return;
+    }
+    ui::text(
+        "Enter — отправить · Esc — очистить ввод · ↑↓ — прокрутка · Ctrl+O — документы", kMarginX, kHintY, kColorFaint);
     ui::text_right("Ctrl+T — треды · Ctrl+N — новый · Ctrl+R — сброс · Ctrl+A — настройки · Ctrl+W — Wi-Fi",
         M5.Display.width() - kMarginX, kHintY, kColorFaint);
 }

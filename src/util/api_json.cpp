@@ -114,9 +114,18 @@ size_t build_request(const OutMessage* msgs, size_t count, const RequestOptions&
         if (i > 0) ok = put(out, out_len, &used, ",");
 
         ok = ok && put(out, out_len, &used, "{\"role\":") &&
-             put_json_string(out, out_len, &used, role_name(msgs[i].role)) &&
-             put(out, out_len, &used, ",\"content\":") &&
-             put_json_string(out, out_len, &used, msgs[i].content ? msgs[i].content : "");
+             put_json_string(out, out_len, &used, role_name(msgs[i].role));
+
+        // Ассистент с вызовами: content бывает null, а tool_calls обязателен.
+        // Сервер сам content не требует, но пустая строка и null для него не
+        // одно и то же — с null сообщение читается как «вызов без текста».
+        if (ok && msgs[i].tool_calls_json != nullptr) {
+            ok = put(out, out_len, &used, ",\"content\":null,\"tool_calls\":") &&
+                 put(out, out_len, &used, msgs[i].tool_calls_json);
+        } else {
+            ok = ok && put(out, out_len, &used, ",\"content\":") &&
+                 put_json_string(out, out_len, &used, msgs[i].content ? msgs[i].content : "");
+        }
 
         // tool_call_id и name обязательны для role=tool: без них модель не
         // сопоставит результат с вызовом.
@@ -146,6 +155,12 @@ size_t build_request(const OutMessage* msgs, size_t count, const RequestOptions&
     if (ok && opt.max_tokens > 0) {
         snprintf(number, sizeof(number), "%u", opt.max_tokens);
         ok = put(out, out_len, &used, ",\"max_tokens\":") && put(out, out_len, &used, number);
+    }
+
+    // tools — массив как есть, собранный tools::Registry. Не проверяем его
+    // здесь: схему описывает реестр, а builder только переносит.
+    if (ok && opt.tools_json != nullptr && opt.tools_json[0] != '\0') {
+        ok = put(out, out_len, &used, ",\"tools\":") && put(out, out_len, &used, opt.tools_json);
     }
 
     ok = ok && put(out, out_len, &used, "}");

@@ -8,6 +8,11 @@
 
 namespace chatview {
 
+bool service_turn(size_t content_len, size_t tool_calls_len)
+{
+    return content_len == 0 && tool_calls_len > 0;
+}
+
 size_t lines_per_page(int area_height, int line_height)
 {
     if (line_height <= 0 || area_height <= 0) return 0;
@@ -30,7 +35,12 @@ Window compute(const uint16_t* line_counts, size_t count, size_t max_lines, size
 
     for (size_t i = count; i > 0; --i) {
         const size_t idx = i - 1;
-        const size_t lines = line_counts[idx] > 0 ? line_counts[idx] : 1;
+        // 0 строк — сообщение в ленте не показывается (служебный ход модели с
+        // вызовами). Пропускаем, не тратя место и не двигая границу окна:
+        // иначе первым видимым окажется оно, и paint_feed нарисует подпись
+        // роли с пустой строкой.
+        if (line_counts[idx] == 0) continue;
+        const size_t lines = line_counts[idx];
 
         // Прокрутка: пропускаем строки снизу, не показывая их.
         if (skipped < scroll) {

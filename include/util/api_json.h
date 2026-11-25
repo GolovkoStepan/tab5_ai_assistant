@@ -37,6 +37,13 @@ struct OutMessage {
     const char* tool_call_id{nullptr};
     /// Для role == Tool: имя инструмента.
     const char* name{nullptr};
+    /// Для role == Assistant: вызовы инструментов, которые модель сделала в
+    /// этом сообщении, — массив JSON как есть (`[{"id":…,"function":{…}}]`).
+    ///
+    /// Сервер не сверяет `tool_call_id` (проверено, Р-025), но сообщение
+    /// ассистента с вызовами возвращать надо: без него модель не понимает,
+    /// на что именно отвечают сообщения role=tool.
+    const char* tool_calls_json{nullptr};
 };
 
 /// Параметры запроса.
@@ -50,6 +57,13 @@ struct RequestOptions {
     bool stream{true};
     /// Верхний предел выходных токенов; 0 — не указывать.
     unsigned max_tokens{0};
+    /// Описание инструментов — массив JSON как есть, из
+    /// tools::Registry::build_tools_json(). nullptr — поле не передавать.
+    ///
+    /// Передавать надо в КАЖДОМ запросе цикла, включая ход с результатами
+    /// инструментов: без `tools` модель иногда печатает внутреннюю разметку
+    /// DSML прямо в текст ответа (Р-025).
+    const char* tools_json{nullptr};
 };
 
 /// Собирает тело POST-запроса к /chat/completions.

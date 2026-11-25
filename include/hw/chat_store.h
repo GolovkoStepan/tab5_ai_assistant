@@ -32,6 +32,16 @@ struct ChatMessage {
     long input_tokens{0};
     long output_tokens{0};
     bool partial{false};
+    /// Для role == Tool: вызов, на который это сообщение отвечает.
+    char tool_call_id[chatline::kToolCallIdLen]{};
+    /// Для role == Tool: имя инструмента.
+    char name[chatline::kToolNameLen]{};
+    /// Для role == Assistant: массив вызовов как есть (указывает в арену).
+    ///
+    /// Хранится, даже если мы его уже выполнили: без этого сообщения сервер
+    /// не понимает, на что отвечают последующие role=tool.
+    const char* tool_calls{nullptr};
+    size_t tool_calls_len{0};
 };
 
 class ChatStore {
@@ -46,7 +56,12 @@ public:
     static constexpr size_t kMaxFileBytes = 256 * 1024;
 
     /// Максимальная длина одной строки файла.
-    static constexpr size_t kMaxLineBytes = 16 * 1024;
+    ///
+    /// 40 КБ, а не 16: в строке сообщения ассистента лежит массив вызовов
+    /// инструментов, а в аргументах write_doc — текст документа. Восемь
+    /// вызовов по 4 КБ не влезли бы в 16 КБ, и строка не записалась бы —
+    /// агент выглядел бы «сломавшимся» на ровном месте.
+    static constexpr size_t kMaxLineBytes = 40 * 1024;
 
     /// Максимальная длина текста одного сообщения.
     static constexpr size_t kMaxContentBytes = 12 * 1024;
@@ -82,8 +97,12 @@ public:
     /// Порядок важен: если запись не удалась, сообщение не должно попасть в
     /// ленту — иначе оно исчезнет после перезагрузки, и пользователь решит,
     /// что тред «теряет сообщения».
+    /// @param tool_call_id для role == Tool: идентификатор вызова
+    /// @param name         для role == Tool: имя инструмента
+    /// @param tool_calls   для role == Assistant: массив вызовов как есть
     bool append(const api::Role& role, const char* content, const char* ts, long input_tokens, long output_tokens,
-        char* err, size_t err_len);
+        char* err, size_t err_len, const char* tool_call_id = nullptr, const char* name = nullptr,
+        const char* tool_calls = nullptr);
 
     /// Откатить последнее сообщение, если это вопрос пользователя без ответа.
     ///
@@ -113,6 +132,13 @@ public:
     /// @return false, если тред не открыт или ответ уже не помещается (тогда
     ///         кусок отброшен, а ответ помечается неполным)
     bool append_to_last(const char* text, size_t len);
+
+    /// Приложить к последнему (растущему) сообщению массив вызовов инструментов.
+    ///
+    /// Нужно, когда модель вместо текста попросила инструменты: её сообщение с
+    /// вызовами обязано попасть в файл и в следующий запрос, иначе сервер не
+    /// свяжет ответы role=tool с вызовами.
+    bool set_last_tool_calls(const char* json);
 
     /// Зафиксировать служебные поля последнего сообщения: время, счётчики,
     /// пометку неполного ответа.
@@ -209,7 +235,8 @@ private:
 
     /// Скопировать текст в арену и заполнить ChatMessage.
     bool store_message(const api::Role& role, const char* content, const char* ts, long input_tokens,
-        long output_tokens, bool partial, ChatMessage& out);
+        long output_tokens, bool partial, ChatMessage& out, const char* tool_call_id = nullptr,
+        const char* name = nullptr, const char* tool_calls = nullptr);
 
     /// Готовит строку JSONL сообщения. false — не поместилось.
     static bool build_line(const ChatMessage& msg, char* out, size_t out_len);
@@ -231,6 +258,16 @@ private:
 
     ChatMessage _messages[kMaxMessages]{};
     size_t _count{0};
+
+    /// Буфер под массив вызовов инструментов при разборе строки. Один на
+    /// весь разбор: текст копируется в арену сразу, поэтому живой он не
+    /// остаётся. 8 КБ с запасом на несколько вызовов с аргументами.
+    char* _calls_scratch{nullptr};
+    static constexpr size_t kCallsScratchBytes = kMaxLineBytes;
+
+    /// Буфер строки для записи. В PSRAM: 40 КБ статикой отнимали бы
+    /// внутреннюю RAM, которая нужна TLS.
+    char* _line{nullptr};
 
     char _slug[48]{};
     /// Последнее сообщение изменено в памяти, но ещё не записано в файл.

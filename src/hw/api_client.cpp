@@ -86,6 +86,20 @@ bool ApiClient::start(
     _reasoning_tokens = 0;
     _usage_seen = false;
 
+    // Накопитель вызовов — в PSRAM: 8 вызовов по 2 КБ аргументов не помещаются
+    // на стеке задачи интерфейса.
+    if (_calls == nullptr) {
+        _calls = static_cast<tools::Accumulator*>(
+            static_cast<void*>(heap_caps_malloc(sizeof(tools::Accumulator), MALLOC_CAP_SPIRAM)));
+        if (_calls == nullptr) _calls = static_cast<tools::Accumulator*>(malloc(sizeof(tools::Accumulator)));
+        if (_calls == nullptr) {
+            if (err && err_len > 0) snprintf(err, err_len, "не хватило памяти на вызовы инструментов");
+            return false;
+        }
+        new (_calls) tools::Accumulator();
+    }
+    _calls->reset();
+
     // Повторы считаются от начала запроса, а не от начала попытки.
     _attempt = 0;
     _retry_at_ms = 0;
@@ -176,6 +190,10 @@ void ApiClient::handle_event(const char* data, size_t len)
 
     if (chunk.has_reasoning && _listener != nullptr) _listener->on_reasoning(reasoning, chunk.reasoning_len);
     if (chunk.has_text && _listener != nullptr) _listener->on_text(text, chunk.text_len);
+
+    // Вызовы инструментов приходят кусками; кормим накопитель каждым чанком.
+    // Склеивать обязательно: короткий вызов приезжает за десяток дельт (Р-025).
+    if (_calls != nullptr) _calls->feed(data, len);
 
     if (chunk.has_finish) {
         snprintf(_finish_reason, sizeof(_finish_reason), "%s", chunk.finish_reason);
@@ -347,6 +365,7 @@ void ApiClient::handle_full_response()
         api::parse_full_response(body.c_str(), body.length(), chunk, text, kFullCap, reasoning, sizeof(reasoning));
 
     if (parsed) {
+        if (_calls != nullptr) _calls->feed(body.c_str(), body.length());
         if (chunk.has_reasoning && _listener != nullptr) _listener->on_reasoning(reasoning, chunk.reasoning_len);
         if (chunk.has_text && _listener != nullptr) _listener->on_text(text, chunk.text_len);
         if (chunk.has_finish) snprintf(_finish_reason, sizeof(_finish_reason), "%s", chunk.finish_reason);
@@ -523,11 +542,21 @@ void ApiClient::finish(State state)
     _state = state;
 
     if (state == State::Done && _listener != nullptr) {
+        // Вызовы — ДО on_finished: к этому моменту аргументы склеены целиком, а
+        // слушатель ещё не решил, что ответ закончен. Ориентироваться на
+        // finish_reason нельзя: наблюдали и "stop" при непустом наборе.
+        if (_calls != nullptr && _calls->any()) _listener->on_tool_calls(*_calls);
+
         // finish_reason мог не прийти, если поток закрылся без него: считаем
         // ответ завершённым нормально. Обрыв отличается тем, что слушатель
         // получил меньше текста, чем ожидал, — это его дело.
         _listener->on_finished(_finish_reason[0] != '\0' ? _finish_reason : "stop");
     }
+
+    // Накопитель не освобождаем: он нужен следующему шагу агентского цикла, а
+    // выделять и освобождать 34 КБ PSRAM на каждый запрос — готовые дырки в
+    // куче посреди диалога. Держим один на весь клиент.
+    if (_calls != nullptr) _calls->reset();
 }
 
 void ApiClient::cancel()

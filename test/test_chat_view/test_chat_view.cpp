@@ -121,15 +121,21 @@ void test_scroll_beyond_top_is_clamped()
     TEST_ASSERT_TRUE(w.visible_count <= 2);
 }
 
-/// Пустые сообщения не занимают строк — но и не ломают подсчёт: у пустого
-/// сообщения height 0, а пустая строка всё равно занимает место в ленте.
-void test_zero_line_message_counted_as_one()
+/// Ноль строк означает «в ленте не показывать».
+///
+/// Раньше здесь было наоборот: 0 считался за одну строку, чтобы пустое
+/// сообщение (ответ только начался) не разъезжалось с отрисовкой. Теперь
+/// измерение само не даёт нуля для обычного сообщения — `count_lines` для
+/// пустого текста возвращает 1, — а ноль выставляет только служебный ход
+/// модели. Поэтому «0 = скрыть» и «пустая реплика = 1 строка» больше не
+/// противоречат друг другу.
+void test_zero_line_message_is_hidden()
 {
     const uint16_t lines[] = {0};
     const chatview::Window w = chatview::compute(lines, 1, 10, 0);
 
-    TEST_ASSERT_EQUAL_INT(0, w.first_msg);
-    TEST_ASSERT_EQUAL_UINT32(1, w.lines_used);
+    TEST_ASSERT_EQUAL_INT(-1, w.first_msg);
+    TEST_ASSERT_EQUAL_UINT32(0, w.lines_used);
 }
 
 /// Ровно влезающая лента не должна помечаться как обрезанная сверху: иначе
@@ -168,6 +174,51 @@ void test_zero_max_lines()
     TEST_ASSERT_EQUAL_UINT32(0, w.visible_count);
 }
 
+/// Служебный ход модели: пустой текст, только вызовы инструментов.
+void test_service_turn_is_empty_text_with_calls()
+{
+    TEST_ASSERT_TRUE(chatview::service_turn(0, 100));
+    TEST_ASSERT_FALSE(chatview::service_turn(5, 100));  // текст есть — видно реплику
+    TEST_ASSERT_FALSE(chatview::service_turn(0, 0));    // обычная пустая реплика (стриминг)
+}
+
+/// Сообщение с нулём строк не занимает места в окне и не считается видимым.
+///
+/// Живой прогон: агент писал в тред служебный ход модели (пустой текст плюс
+/// вызовы инструментов), и лента показывала перед каждым вызовом пустую
+/// реплику «модель», а после — ещё одну. Протокол требует держать такое
+/// сообщение в истории, но показывать его нечего.
+void test_zero_lines_message_is_skipped()
+{
+    const uint16_t lines[] = {2, 0, 2};
+    const chatview::Window w = chatview::compute(lines, 3, 10, 0);
+
+    TEST_ASSERT_EQUAL_UINT32(4, w.lines_used);
+    TEST_ASSERT_EQUAL_UINT32(2, w.visible_count);
+    TEST_ASSERT_EQUAL_INT(0, w.first_msg);
+}
+
+/// Если в конце треда служебный ход, окно не должно показывать пустоту.
+void test_trailing_service_turn_does_not_empty_window()
+{
+    const uint16_t lines[] = {3, 0, 0};
+    const chatview::Window w = chatview::compute(lines, 3, 10, 0);
+
+    TEST_ASSERT_EQUAL_INT(0, w.first_msg);
+    TEST_ASSERT_EQUAL_UINT32(1, w.visible_count);
+    TEST_ASSERT_EQUAL_UINT32(3, w.lines_used);
+}
+
+/// Тред из одних служебных ходов: показывать нечего, окно пустое.
+void test_only_service_turns()
+{
+    const uint16_t lines[] = {0, 0};
+    const chatview::Window w = chatview::compute(lines, 2, 10, 0);
+
+    TEST_ASSERT_EQUAL_INT(-1, w.first_msg);
+    TEST_ASSERT_EQUAL_UINT32(0, w.visible_count);
+}
+
 /// Много сообщений по одной строке: влезает ровно столько, сколько строк.
 void test_many_single_line_messages()
 {
@@ -192,10 +243,14 @@ int main(int, char**)
     RUN_TEST(test_scroll_up_skips_from_bottom);
     RUN_TEST(test_scroll_inside_long_message);
     RUN_TEST(test_scroll_beyond_top_is_clamped);
-    RUN_TEST(test_zero_line_message_counted_as_one);
+    RUN_TEST(test_zero_line_message_is_hidden);
     RUN_TEST(test_exactly_fits_not_clipped);
     RUN_TEST(test_partial_top_keeps_newest);
     RUN_TEST(test_zero_max_lines);
     RUN_TEST(test_many_single_line_messages);
+    RUN_TEST(test_service_turn_is_empty_text_with_calls);
+    RUN_TEST(test_zero_lines_message_is_skipped);
+    RUN_TEST(test_trailing_service_turn_does_not_empty_window);
+    RUN_TEST(test_only_service_turns);
     return UNITY_END();
 }

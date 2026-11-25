@@ -234,6 +234,83 @@ void test_estimate_size_grows_with_content()
     TEST_ASSERT_GREATER_THAN(chatline::estimate_size(""), chatline::estimate_size("длинный текст"));
 }
 
+// --- Сообщения агента -------------------------------------------------------
+
+/// Результат инструмента: role=tool с tool_call_id и name. Без ссылки на вызов
+/// сервер не сопоставит результат с вопросом модели.
+void test_build_tool_message()
+{
+    const size_t n = chatline::build(api::Role::Tool, "Создан документ home/x.md", nullptr, chatline::Usage{}, g_buf,
+        sizeof(g_buf), "call_1", "write_doc");
+    TEST_ASSERT_GREATER_THAN(0, n);
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "\"role\":\"tool\""));
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "\"tool_call_id\":\"call_1\""));
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "\"name\":\"write_doc\""));
+}
+
+/// Сообщение ассистента с вызовами: массив переносится как есть, байт в байт.
+/// Пересобрать его из структуры значило бы разойтись с тем, что сказала модель.
+void test_build_assistant_with_tool_calls()
+{
+    const char* calls =
+        "[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_doc\",\"arguments\":\"{}\"}}]";
+    const size_t n = chatline::build(
+        api::Role::Assistant, "", nullptr, chatline::Usage{}, g_buf, sizeof(g_buf), nullptr, nullptr, calls);
+    TEST_ASSERT_GREATER_THAN(0, n);
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "\"tool_calls\":"));
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "read_doc"));
+}
+
+/// Круг для результата инструмента: id и имя возвращаются теми же.
+void test_tool_message_roundtrip()
+{
+    char calls[512];
+    const size_t n = chatline::build(
+        api::Role::Tool, "Ошибка: файла нет", nullptr, chatline::Usage{}, g_buf, sizeof(g_buf), "call_abc", "read_doc");
+    TEST_ASSERT_GREATER_THAN(0, n);
+
+    chatline::Entry e;
+    TEST_ASSERT_TRUE(chatline::parse(g_buf, n, e, g_content, sizeof(g_content), calls, sizeof(calls)));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(api::Role::Tool), static_cast<uint8_t>(e.role));
+    TEST_ASSERT_EQUAL_STRING("call_abc", e.tool_call_id);
+    TEST_ASSERT_EQUAL_STRING("read_doc", e.name);
+    TEST_ASSERT_EQUAL_STRING("Ошибка: файла нет", e.content);
+}
+
+/// Круг для массива вызовов: текст сохраняется как JSON, который снова
+/// разбирается — иначе после перезагрузки история стала бы неотправляемой.
+void test_tool_calls_roundtrip()
+{
+    const char* calls =
+        "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"search_docs\",\"arguments\":\"{\\\"query\\\":"
+        "\\\"фильтр\\\"}\"}}]";
+    const size_t n = chatline::build(
+        api::Role::Assistant, "", nullptr, chatline::Usage{}, g_buf, sizeof(g_buf), nullptr, nullptr, calls);
+    TEST_ASSERT_GREATER_THAN(0, n);
+
+    char calls_out[1024];
+    chatline::Entry e;
+    TEST_ASSERT_TRUE(chatline::parse(g_buf, n, e, g_content, sizeof(g_content), calls_out, sizeof(calls_out)));
+    TEST_ASSERT_NOT_NULL(e.tool_calls);
+    TEST_ASSERT_GREATER_THAN(0, e.tool_calls_len);
+    TEST_ASSERT_EQUAL_STRING(calls, calls_out);
+}
+
+/// Массив вызовов не влез в буфер — честный отказ, а не молча потерянные
+/// вызовы: без них история не отправится, и это надо заметить при разборе.
+void test_tool_calls_small_buffer_returns_false()
+{
+    const char* calls =
+        "[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_doc\",\"arguments\":\"{}\"}}]";
+    const size_t n = chatline::build(
+        api::Role::Assistant, "", nullptr, chatline::Usage{}, g_buf, sizeof(g_buf), nullptr, nullptr, calls);
+    TEST_ASSERT_GREATER_THAN(0, n);
+
+    char small[16];
+    chatline::Entry e;
+    TEST_ASSERT_FALSE(chatline::parse(g_buf, n, e, g_content, sizeof(g_content), small, sizeof(small)));
+}
+
 int main(int, char**)
 {
     UNITY_BEGIN();
@@ -257,5 +334,11 @@ int main(int, char**)
     RUN_TEST(test_parse_small_content_buffer_returns_false);
     RUN_TEST(test_build_parse_roundtrip);
     RUN_TEST(test_estimate_size_grows_with_content);
+
+    RUN_TEST(test_build_tool_message);
+    RUN_TEST(test_build_assistant_with_tool_calls);
+    RUN_TEST(test_tool_message_roundtrip);
+    RUN_TEST(test_tool_calls_roundtrip);
+    RUN_TEST(test_tool_calls_small_buffer_returns_false);
     return UNITY_END();
 }

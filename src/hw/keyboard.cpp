@@ -144,6 +144,78 @@ bool Keyboard::translate(const Event& ev, KeyEvent& out)
     return true;
 }
 
+/// Пауза после отказа светодиодов. Клавиатура съёмная: если её отстегнули,
+/// каждая запись — таймаут I2C, и повторять это каждый кадр нельзя. 5 секунд
+/// достаточно, чтобы пристёгнутая обратно клавиатура ожила без перезагрузки,
+/// и достаточно редко, чтобы не тормозить интерфейс.
+constexpr uint32_t kLedRetryMs = 5000;
+
+bool Keyboard::ledFailed()
+{
+    _led_dead = true;
+    _led_retry_at_ms = millis() + kLedRetryMs;
+    // Считаем, что в клавиатуре ничего не записано: после возврата на шину
+    // придётся выставить и режим, и цвет, и яркость заново. Желаемые значения
+    // (_led_brightness_wanted, _led_left/_led_right) не трогаем — их и надо
+    // будет повторить.
+    _led_custom = false;
+    _led_written = false;
+    _led_brightness = 0xFF;
+    return false;
+}
+
+bool Keyboard::setLedBrightness(uint8_t percent)
+{
+    if (percent > 100) percent = 100;
+    _led_brightness_wanted = percent;
+
+    if (_led_brightness == percent) return true;
+    if (_led_dead && static_cast<int32_t>(millis() - _led_retry_at_ms) < 0) return false;
+
+    // Яркость — глобальная на оба светодиода, регистр 0x03. Заводское
+    // значение 20: на столе этого хватает, ночью — слепит, поэтому ставим 10.
+    if (!_keyboard.writeBrightness(percent)) return ledFailed();
+    _led_dead = false;
+    _led_brightness = percent;
+    return true;
+}
+
+bool Keyboard::setLeds(const led::Rgb& left, const led::Rgb& right)
+{
+    // Ничего не изменилось — не трогаем шину. Желаемую яркость проверяем тоже:
+    // иначе отложенная из setup() запись не применилась бы, пока цвет совпал.
+    const bool brightness_pending = _led_brightness_wanted != 0xFF && _led_brightness != _led_brightness_wanted;
+    if (!_led_dead && _led_written && !brightness_pending && left == _led_left && right == _led_right) return true;
+    if (_led_dead && static_cast<int32_t>(millis() - _led_retry_at_ms) < 0) return false;
+
+    // Отложенная яркость: вызов из setup() мог не дойти до клавиатуры (её
+    // отстегнули, шина не ответила). Повторяем здесь — это единственное место,
+    // которое вызывается регулярно.
+    if (brightness_pending) {
+        if (!_keyboard.writeBrightness(_led_brightness_wanted)) return ledFailed();
+        _led_brightness = _led_brightness_wanted;
+    }
+
+    // В заводском режиме Bind цветом управляет прошивка клавиатуры: левый
+    // светодиод показывает модификаторы, правый — режим (синий = Normal).
+    // Записи в регистры цвета в этом режиме игнорируются, поэтому переводим
+    // в Custom один раз. Родная индикация режима при этом пропадает — она
+    // всё равно бесполезна: режим у нас всегда Normal.
+    if (!_led_custom) {
+        if (!_keyboard.writeRgbMode(m5::unit::tab5_keyboard::RgbMode::Custom)) return ledFailed();
+        _led_custom = true;
+    }
+
+    if (!_keyboard.writeRgb(0, left.r, left.g, left.b)) return ledFailed();
+    if (!_keyboard.writeRgb(1, right.r, right.g, right.b)) return ledFailed();
+
+    _led_dead = false;
+    _led_left = left;
+    _led_right = right;
+    _led_written = true;
+    return true;
+}
+
 bool Keyboard::poll(KeyEvent& out)
 {
     _units.update();

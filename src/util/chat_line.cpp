@@ -70,7 +70,8 @@ size_t estimate_size(const char* content)
     return n + n / 2 + 128;
 }
 
-size_t build(const api::Role& role, const char* content, const char* ts, const Usage& usage, char* out, size_t out_len)
+size_t build(const api::Role& role, const char* content, const char* ts, const Usage& usage, char* out, size_t out_len,
+    const char* tool_call_id, const char* name, const char* tool_calls)
 {
     if (out == nullptr || out_len == 0) return 0;
 
@@ -98,11 +99,29 @@ size_t build(const api::Role& role, const char* content, const char* ts, const U
         ok = put(out, out_len, &used, ",\"partial\":true");
     }
 
+    // Сообщение ассистента с вызовами: массив переносим как есть, без разбора.
+    // Разобранным он уже был в накопителе (util/tool_calls), а здесь важно
+    // сохранить ровно то, что сказала модель.
+    if (ok && role == api::Role::Assistant && tool_calls != nullptr && tool_calls[0] != '\0') {
+        ok = put(out, out_len, &used, ",\"tool_calls\":") && put(out, out_len, &used, tool_calls);
+    }
+
+    // Результат инструмента: без tool_call_id сервер не сопоставит его с
+    // вызовом, а без name модель не поймёт, что это был за инструмент.
+    if (ok && role == api::Role::Tool) {
+        if (tool_call_id != nullptr && tool_call_id[0] != '\0') {
+            ok = put(out, out_len, &used, ",\"tool_call_id\":") && put_json_string(out, out_len, &used, tool_call_id);
+        }
+        if (ok && name != nullptr && name[0] != '\0') {
+            ok = put(out, out_len, &used, ",\"name\":") && put_json_string(out, out_len, &used, name);
+        }
+    }
+
     ok = ok && put(out, out_len, &used, "}");
     return ok ? used : 0;
 }
 
-bool parse(char* line, size_t len, Entry& out, char* content_out, size_t content_cap)
+bool parse(char* line, size_t len, Entry& out, char* content_out, size_t content_cap, char* calls_out, size_t calls_cap)
 {
     if (line == nullptr || len == 0 || content_out == nullptr || content_cap == 0) return false;
 
@@ -143,6 +162,30 @@ bool parse(char* line, size_t len, Entry& out, char* content_out, size_t content
     }
 
     out.partial = root["partial"] | false;
+
+    // Вызовы инструмента: их текст нужен ровно таким, каким пришёл. Хранить
+    // разобранную структуру значило бы при отправке собирать её обратно — и
+    // расходиться с тем, что модель сказала.
+    JsonVariant calls = root["tool_calls"];
+    out.tool_calls = nullptr;
+    out.tool_calls_len = 0;
+    if (!calls.isNull() && calls_out != nullptr && calls_cap > 0) {
+        // measureJson даёт точную длину без промежуточной строки: массив
+        // вызовов с аргументами бывает на килобайт, и лишняя копия в пуле
+        // ArduinoJson ни к чему.
+        const size_t need = measureJson(calls);
+        if (need + 1 > calls_cap) return false;
+        serializeJson(calls, calls_out, calls_cap);
+        out.tool_calls = calls_out;
+        out.tool_calls_len = need;
+    }
+
+    const char* call_id = root["tool_call_id"] | "";
+    snprintf(out.tool_call_id, sizeof(out.tool_call_id), "%s", call_id);
+
+    const char* tool_name = root["name"] | "";
+    snprintf(out.name, sizeof(out.name), "%s", tool_name);
+
     return true;
 }
 

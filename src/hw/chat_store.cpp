@@ -36,9 +36,6 @@
 namespace hw {
 namespace {
 
-/// Буфер строки: собираем строку целиком, чтобы запись была одной операцией.
-char g_line[ChatStore::kMaxLineBytes];
-
 /// Выделить буфер в PSRAM, при неудаче — в обычной куче.
 char* alloc_psram(size_t size)
 {
@@ -79,8 +76,10 @@ bool ChatStore::begin()
     if (_arena == nullptr) _arena = alloc_psram(kMaxArenaBytes);
     if (_tail == nullptr) _tail = alloc_psram(kMaxContentBytes + 1);
     if (_file == nullptr) _file = alloc_psram(kMaxFileBytes + 1);
+    if (_calls_scratch == nullptr) _calls_scratch = alloc_psram(kCallsScratchBytes);
+    if (_line == nullptr) _line = alloc_psram(kMaxLineBytes);
 
-    _ready = _arena != nullptr && _tail != nullptr && _file != nullptr;
+    _ready = _arena != nullptr && _tail != nullptr && _file != nullptr && _calls_scratch != nullptr && _line != nullptr;
     return _ready;
 }
 
@@ -195,13 +194,16 @@ bool ChatStore::read_file(const char* slug)
 }
 
 bool ChatStore::store_message(const api::Role& role, const char* content, const char* ts, long input_tokens,
-    long output_tokens, bool partial, ChatMessage& out)
+    long output_tokens, bool partial, ChatMessage& out, const char* tool_call_id, const char* name,
+    const char* tool_calls)
 {
     if (content == nullptr) content = "";
     const size_t n = strlen(content);
     if (n > kMaxContentBytes) return false;
 
-    if (_arena == nullptr || _arena_used + n + 1 > kMaxArenaBytes) {
+    const size_t calls_len = tool_calls != nullptr ? strlen(tool_calls) : 0;
+
+    if (_arena == nullptr || _arena_used + n + 1 + calls_len + 1 > kMaxArenaBytes) {
         // Арена кончилась. Это следствие длинного треда: вызывающий увидит
         // false и сможет начать новый.
         return false;
@@ -212,11 +214,24 @@ bool ChatStore::store_message(const api::Role& role, const char* content, const 
     out.content_len = n;
     _arena_used += n + 1;
 
+    // Вызовы инструмента тоже в арене: они переживают ответ и уходят в
+    // следующие запросы, значит должны жить, пока открыт тред.
+    out.tool_calls = nullptr;
+    out.tool_calls_len = 0;
+    if (calls_len > 0) {
+        memcpy(_arena + _arena_used, tool_calls, calls_len + 1);
+        out.tool_calls = _arena + _arena_used;
+        out.tool_calls_len = calls_len;
+        _arena_used += calls_len + 1;
+    }
+
     out.role = role;
     snprintf(out.ts, sizeof(out.ts), "%s", ts != nullptr ? ts : "");
     out.input_tokens = input_tokens;
     out.output_tokens = output_tokens;
     out.partial = partial;
+    snprintf(out.tool_call_id, sizeof(out.tool_call_id), "%s", tool_call_id != nullptr ? tool_call_id : "");
+    snprintf(out.name, sizeof(out.name), "%s", name != nullptr ? name : "");
     return true;
 }
 
@@ -247,7 +262,16 @@ void ChatStore::parse_buffer()
             const size_t room = kMaxArenaBytes - _arena_used;
 
             chatline::Entry entry;
-            if (chatline::parse(line, len, entry, _arena + _arena_used, room)) {
+            if (chatline::parse(line, len, entry, _arena + _arena_used, room, _calls_scratch, kCallsScratchBytes)) {
+                // Текст вызовов тоже копируется в арену: _calls_scratch один на
+                // весь разбор и на следующей итерации будет перезаписан.
+                const size_t calls_len = entry.tool_calls_len;
+                const size_t need = entry.content_len + 1 + (calls_len > 0 ? calls_len + 1 : 0);
+                if (need > room) {
+                    line = _file + i + 1;
+                    continue;
+                }
+
                 msg.role = entry.role;
                 msg.content = _arena + _arena_used;
                 msg.content_len = entry.content_len;
@@ -255,7 +279,19 @@ void ChatStore::parse_buffer()
                 msg.input_tokens = entry.input_tokens;
                 msg.output_tokens = entry.output_tokens;
                 msg.partial = entry.partial;
-                _arena_used += entry.content_len + 1;
+                snprintf(msg.tool_call_id, sizeof(msg.tool_call_id), "%s", entry.tool_call_id);
+                snprintf(msg.name, sizeof(msg.name), "%s", entry.name);
+
+                msg.tool_calls = nullptr;
+                msg.tool_calls_len = 0;
+                if (calls_len > 0) {
+                    char* dst = _arena + _arena_used + entry.content_len + 1;
+                    memcpy(dst, _calls_scratch, calls_len + 1);
+                    msg.tool_calls = dst;
+                    msg.tool_calls_len = calls_len;
+                }
+
+                _arena_used += need;
                 ++_count;
             }
             // Битая строка не повод выбрасывать тред: пропускаем её. Обрыв
@@ -444,11 +480,13 @@ bool ChatStore::build_line(const ChatMessage& msg, char* out, size_t out_len)
     usage.output_tokens = msg.output_tokens;
     usage.partial = msg.partial;
 
-    return chatline::build(msg.role, msg.content, msg.ts[0] != '\0' ? msg.ts : nullptr, usage, out, out_len) > 0;
+    return chatline::build(msg.role, msg.content, msg.ts[0] != '\0' ? msg.ts : nullptr, usage, out, out_len,
+               msg.tool_call_id[0] != '\0' ? msg.tool_call_id : nullptr, msg.name[0] != '\0' ? msg.name : nullptr,
+               msg.tool_calls) > 0;
 }
 
 bool ChatStore::append(const api::Role& role, const char* content, const char* ts, long input_tokens,
-    long output_tokens, char* err, size_t err_len)
+    long output_tokens, char* err, size_t err_len, const char* tool_call_id, const char* name, const char* tool_calls)
 {
     if (err && err_len > 0) err[0] = '\0';
     if (!_ready || _slug[0] == '\0') {
@@ -464,12 +502,12 @@ bool ChatStore::append(const api::Role& role, const char* content, const char* t
     // текст не поместится.
     ChatMessage msg;
     const size_t arena_before = _arena_used;
-    if (!store_message(role, content, ts, input_tokens, output_tokens, false, msg)) {
+    if (!store_message(role, content, ts, input_tokens, output_tokens, false, msg, tool_call_id, name, tool_calls)) {
         if (err && err_len > 0) snprintf(err, err_len, "тред переполнен, начните новый");
         return false;
     }
 
-    if (!build_line(msg, g_line, sizeof(g_line))) {
+    if (!build_line(msg, _line, kMaxLineBytes)) {
         _arena_used = arena_before;
         if (err && err_len > 0) snprintf(err, err_len, "сообщение слишком длинное");
         return false;
@@ -485,8 +523,8 @@ bool ChatStore::append(const api::Role& role, const char* content, const char* t
         return false;
     }
 
-    const size_t n = strlen(g_line);
-    const size_t written = f.write(reinterpret_cast<const uint8_t*>(g_line), n);
+    const size_t n = strlen(_line);
+    const size_t written = f.write(reinterpret_cast<const uint8_t*>(_line), n);
     const size_t newline = f.write(reinterpret_cast<const uint8_t*>("\n"), 1);
     f.close();
 
@@ -604,7 +642,16 @@ bool ChatStore::begin_answer(char* err, size_t err_len)
     // Указатель на _tail уникален, так что цикл найдёт не больше одного.
     for (size_t i = _count; i > 0; --i) {
         ChatMessage& prev = _messages[i - 1];
-        if (prev.content != _tail || prev.content_len == 0) continue;
+        if (prev.content != _tail) continue;
+
+        // Пустая реплика (модель попросила инструменты, текста нет) тоже
+        // указывает на _tail. Переселять нечего, но и оставлять указатель
+        // нельзя: _tail будет очищен, и лента показала бы под этой репликой
+        // текст следующего ответа.
+        if (prev.content_len == 0) {
+            prev.content = "";
+            continue;
+        }
 
         const size_t n = prev.content_len;
         if (_arena == nullptr || _arena_used + n + 1 > kMaxArenaBytes) {
@@ -662,6 +709,24 @@ bool ChatStore::append_to_last(const char* text, size_t len)
     return true;
 }
 
+bool ChatStore::set_last_tool_calls(const char* json)
+{
+    if (_count == 0 || json == nullptr || json[0] == '\0') return false;
+
+    ChatMessage& msg = _messages[_count - 1];
+    if (msg.role != api::Role::Assistant) return false;
+
+    const size_t n = strlen(json);
+    if (_arena == nullptr || _arena_used + n + 1 > kMaxArenaBytes) return false;
+
+    memcpy(_arena + _arena_used, json, n + 1);
+    msg.tool_calls = _arena + _arena_used;
+    msg.tool_calls_len = n;
+    _arena_used += n + 1;
+    _unsaved_tail = true;
+    return true;
+}
+
 bool ChatStore::finish_last(const char* ts, long input_tokens, long output_tokens, bool partial)
 {
     if (_count == 0) return false;
@@ -678,6 +743,11 @@ bool ChatStore::finish_last(const char* ts, long input_tokens, long output_token
 void ChatStore::drop_last()
 {
     if (_count == 0) return;
+
+    // Вызовы инструментов лежат в арене последними. Снимаем указатель до
+    // отката: иначе на него ссылалось бы сообщение, которого уже нет.
+    _messages[_count - 1].tool_calls = nullptr;
+    _messages[_count - 1].tool_calls_len = 0;
     --_count;
     _tail_used = 0;
     if (_tail != nullptr) _tail[0] = '\0';
@@ -701,7 +771,7 @@ bool ChatStore::flush_last(char* err, size_t err_len)
     // Плюс к тому дозапись дешевле: rewrite_file писал весь тред (до 256 КБ)
     // после каждого ответа.
     const ChatMessage& last = _messages[_count - 1];
-    if (!build_line(last, g_line, sizeof(g_line))) {
+    if (!build_line(last, _line, kMaxLineBytes)) {
         if (err && err_len > 0) snprintf(err, err_len, "ответ не помещается в строку треда");
         return false;
     }
@@ -715,8 +785,8 @@ bool ChatStore::flush_last(char* err, size_t err_len)
         return false;
     }
 
-    const size_t n = strlen(g_line);
-    const size_t written = f.write(reinterpret_cast<const uint8_t*>(g_line), n);
+    const size_t n = strlen(_line);
+    const size_t written = f.write(reinterpret_cast<const uint8_t*>(_line), n);
     const size_t newline = f.write(reinterpret_cast<const uint8_t*>("\n"), 1);
     f.close();
 

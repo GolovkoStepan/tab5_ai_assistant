@@ -11,6 +11,8 @@
 #include <esp_sntp.h>
 #include <string.h>
 
+#include "util/iso_time.h"
+
 namespace hw {
 namespace clock_sync {
 namespace {
@@ -144,6 +146,30 @@ bool synced()
 bool store_to_rtc()
 {
     return write_rtc_from_system();
+}
+
+bool now_iso(const settings::Config& cfg, char* out, size_t out_len)
+{
+    if (out == nullptr || out_len == 0) return false;
+    out[0] = '\0';
+
+    // Время берём из системных часов, а не из RTC напрямую: их выставляет
+    // clock_sync по NTP, а на незаряженном суперконденсаторе RTC может
+    // отдавать мусор, пока сеть не поднялась.
+    const time_t now = time(nullptr);
+    struct tm t{};
+    localtime_r(&now, &t);
+
+    if (!isotime::is_valid(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec)) return false;
+
+    // Смещение уже учтено localtime_r: TZ выставлена из настроек в begin().
+    // Осталось только записать его явно, чтобы документ, открытый в другом
+    // часовом поясе, показывал верное время.
+    int tz_minutes = 0;
+    if (!isotime::parse_tz_offset(cfg.timezone, &tz_minutes)) tz_minutes = 0;
+
+    return isotime::format_iso8601(
+               out, out_len, t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, tz_minutes) > 0;
 }
 
 }  // namespace clock_sync

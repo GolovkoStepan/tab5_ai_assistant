@@ -88,7 +88,10 @@ constexpr KeyDef kKeys[kRows * kCols] = {
     {Special::None, U'k', U'K', U'л', U'Л'},
     {Special::None, U'l', U'L', U'д', U'Д'},
     {Special::Up, 0, 0, 0, 0},
-    {Special::None, U'_', U'_', 0, 0},
+    // В кириллице на этой клавише живёт точка: на A164 нет отдельной
+    // клавиши `.`, а без точки не набрать ни одного предложения. С Aa —
+    // запятая, ровно как Shift+`.` на обычной клавиатуре.
+    {Special::None, U'_', U'_', U'.', U','},
     {Special::Enter, 0, 0, 0, 0},
 
     // --- Row 4 ---
@@ -110,30 +113,54 @@ constexpr KeyDef kKeys[kRows * kCols] = {
 
 /// Слой символов (зажат Sym). Возвращает код и признак «переопределено».
 /// Затрагивает только клавиши, у которых на Sym лежит другой символ.
-bool symOverride(uint8_t row, uint8_t col, char32_t* out)
+///
+/// Раскладка здесь нужна: на одной и той же клавише в латинице полезен знак
+/// (`_` → `=`), а в кириллице — буква (`_` → `б`). Без раскладки пришлось бы
+/// выбирать что-то одно и терять второе.
+bool symOverride(uint8_t row, uint8_t col, Layout layout, bool shift, char32_t* out)
 {
     // Клавиши с символьным слоем: `!*()[]\ ;' _ — как в прошивке клавиатуры.
     struct SymOverride {
         uint8_t row;
         uint8_t col;
+        Layout layout;
+        bool shift;
         char32_t code;
     };
     static constexpr SymOverride kOverrides[] = {
-        {1, 0, U'~'},   // ` → ~
-        {1, 1, U'?'},   // ! → ?
-        {1, 8, U'/'},   // * → /
-        {1, 9, U'<'},   // ( → <
-        {1, 10, U'>'},  // ) → >
-        {1, 11, U'{'},  // [ → {
-        {1, 12, U'}'},  // ] → }
-        {1, 13, U'|'},  // \ → |
-        {2, 11, U':'},  // ; → :
-        {2, 12, U'"'},  // ' → "
-        {3, 12, U'='},  // _ → =
+        {1, 0, Layout::Latin, false, U'~'},   // ` → ~
+        {1, 1, Layout::Latin, false, U'?'},   // ! → ?
+        {1, 8, Layout::Latin, false, U'/'},   // * → /
+        {1, 9, Layout::Latin, false, U'<'},   // ( → <
+        {1, 10, Layout::Latin, false, U'>'},  // ) → >
+        {1, 11, Layout::Latin, false, U'{'},  // [ → {
+        {1, 12, Layout::Latin, false, U'}'},  // ] → }
+        {1, 13, Layout::Latin, false, U'|'},  // \ → |
+        {2, 11, Layout::Latin, false, U':'},  // ; → :
+        {2, 12, Layout::Latin, false, U'"'},  // ' → "
+        {3, 12, Layout::Latin, false, U'='},  // _ → =
+
+        // Пунктуация и «б» — для кириллицы.
+        //
+        // На A164 в нижнем ряду одна пунктуационная клавиша (`.`), тогда как на
+        // обычной клавиатуре их две: `,` и `/.`. В ЙЦУКЕН на них живут «б» и
+        // «ю/». Из-за этого по-русски нельзя было поставить НИ ТОЧКУ, НИ
+        // ЗАПЯТУЮ, а буквы «б» не было вовсе — самая заметная потеря из всех,
+        // ведь точка нужна в каждом предложении.
+        //
+        // Запятая на Sym+`.` совпадает с тем, что делает и сама M5Stack в своих
+        // HID-таблицах для этой клавиатуры («Row 4 — Sym delta: . → ,»), то
+        // есть это не самодеятельность, а восстановленное штатное поведение.
+        {4, 9, Layout::Latin, false, U','},     // . → ,
+        {4, 9, Layout::Russian, false, U','},   // ю → ,
+        {3, 12, Layout::Russian, false, U'б'},  // _ → б (точка живёт на самой клавише)
+        // Aa — заглавная. Без отдельной записи «Б» набрать нельзя:
+        // переопределение возвращает символ раньше, чем применяется сдвиг.
+        {3, 12, Layout::Russian, true, U'Б'},
     };
 
     for (const auto& o : kOverrides) {
-        if (o.row == row && o.col == col) {
+        if (o.row == row && o.col == col && o.layout == layout && o.shift == shift) {
             *out = o.code;
             return true;
         }
@@ -159,7 +186,7 @@ char32_t codepoint(uint8_t row, uint8_t col, Layout layout, bool shift, bool sym
     // Слой символов перекрывает базовый, но не для букв.
     if (sym) {
         char32_t cp = 0;
-        if (symOverride(row, col, &cp)) return cp;
+        if (symOverride(row, col, layout, shift, &cp)) return cp;
     }
 
     // В русской раскладке у символьных клавиш значение не задано — берём латиницу.

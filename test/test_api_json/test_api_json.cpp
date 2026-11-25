@@ -495,6 +495,56 @@ void test_error_402_balance()
     TEST_ASSERT_EQUAL_STRING("Закончился баланс", out);
 }
 
+/// tools передаются массивом как есть: реестр собирает схему, builder только
+/// переносит её в тело запроса.
+void test_tools_are_passed_through()
+{
+    api::RequestOptions o = options();
+    o.tools_json = "[{\"type\": \"function\", \"function\": {\"name\": \"read_doc\"}}]";
+
+    TEST_ASSERT_GREATER_THAN(0, api::build_request(nullptr, 0, o, g_buf, sizeof(g_buf)));
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "\"tools\":[{\"type\": \"function\""));
+}
+
+void test_tools_omitted_when_null()
+{
+    api::RequestOptions o = options();
+    o.tools_json = nullptr;
+    TEST_ASSERT_GREATER_THAN(0, api::build_request(nullptr, 0, o, g_buf, sizeof(g_buf)));
+    TEST_ASSERT_NULL(strstr(g_buf, "\"tools\""));
+}
+
+/// Ассистент с вызовами: content = null, tool_calls — массив. Это форма,
+/// которую RouterAI ждёт при возврате результата инструмента (Р-025).
+void test_assistant_message_with_tool_calls()
+{
+    api::OutMessage msgs[1];
+    msgs[0].role = api::Role::Assistant;
+    msgs[0].content = nullptr;
+    msgs[0].tool_calls_json =
+        "[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_doc\",\"arguments\":\"{}\"}}]";
+
+    TEST_ASSERT_GREATER_THAN(0, api::build_request(msgs, 1, options(), g_buf, sizeof(g_buf)));
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "\"content\":null"));
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "\"tool_calls\":[{\"id\":\"call_1\""));
+}
+
+/// Ответ инструмента: role=tool с tool_call_id. Без идентификатора модель не
+/// сопоставит результат с вызовом.
+void test_tool_message_has_call_id()
+{
+    api::OutMessage msgs[1];
+    msgs[0].role = api::Role::Tool;
+    msgs[0].content = "Создан документ home/x.md";
+    msgs[0].tool_call_id = "call_abc";
+    msgs[0].name = "write_doc";
+
+    TEST_ASSERT_GREATER_THAN(0, api::build_request(msgs, 1, options(), g_buf, sizeof(g_buf)));
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "\"role\":\"tool\""));
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "\"tool_call_id\":\"call_abc\""));
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "\"name\":\"write_doc\""));
+}
+
 int main(int, char**)
 {
     UNITY_BEGIN();
@@ -504,6 +554,11 @@ int main(int, char**)
     RUN_TEST(test_stream_flag_false);
     RUN_TEST(test_reasoning_effort_as_string);
     RUN_TEST(test_reasoning_effort_omitted_when_null);
+
+    RUN_TEST(test_tools_are_passed_through);
+    RUN_TEST(test_tools_omitted_when_null);
+    RUN_TEST(test_assistant_message_with_tool_calls);
+    RUN_TEST(test_tool_message_has_call_id);
     RUN_TEST(test_max_tokens_only_when_set);
     RUN_TEST(test_content_is_escaped);
     RUN_TEST(test_multiple_messages_in_order);

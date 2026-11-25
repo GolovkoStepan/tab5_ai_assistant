@@ -27,6 +27,10 @@ struct Message {
     size_t content_len{0};
     const char* tool_call_id{nullptr};
     const char* name{nullptr};
+    /// Для role == Assistant: массив вызовов инструментов как есть. В бюджет
+    /// не входит (это не текст для чтения), но уходить в запрос обязан: без
+    /// него сервер не свяжет ответы role=tool с вызовами.
+    const char* tool_calls{nullptr};
 };
 
 /// Что осталось после обрезки.
