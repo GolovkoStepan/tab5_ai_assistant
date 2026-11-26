@@ -27,6 +27,7 @@
 
 #include <Arduino.h>
 #include <HTTPClient.h>
+#include <NetworkClient.h>
 #include <NetworkClientSecure.h>
 #include <esp_heap_caps.h>
 #include <string.h>
@@ -100,6 +101,20 @@ bool ApiClient::start(
     }
     _calls->reset();
 
+    // Источники веб-поиска — тоже в PSRAM: пять записей по ~600 байт это 3 КБ,
+    // а рядом TLS и история чата.
+    if (_sources == nullptr) {
+        _sources = static_cast<web::List*>(static_cast<void*>(heap_caps_malloc(sizeof(web::List), MALLOC_CAP_SPIRAM)));
+        if (_sources == nullptr) _sources = static_cast<web::List*>(malloc(sizeof(web::List)));
+        if (_sources == nullptr) {
+            if (err && err_len > 0) snprintf(err, err_len, "не хватило памяти на источники поиска");
+            return false;
+        }
+        new (_sources) web::List();
+    }
+    _sources->clear();
+    _sources_seen = false;
+
     // Повторы считаются от начала запроса, а не от начала попытки.
     _attempt = 0;
     _retry_at_ms = 0;
@@ -144,11 +159,9 @@ bool ApiClient::start(
     memcpy(_body, body, body_len + 1);
     _body_len = body_len;
 
-    _sse = new sse::Parser(&ApiClient::on_sse_event, this);
-    if (_sse == nullptr) {
+    if (!ensure_sse(err, err_len)) {
         free(_body);
         _body = nullptr;
-        if (err && err_len > 0) snprintf(err, err_len, "%s", "не хватило памяти на парсер");
         return false;
     }
 
@@ -159,6 +172,17 @@ bool ApiClient::start(
     _started_ms = millis();
     _last_byte_ms = _started_ms;
     _state = State::Connecting;
+    return true;
+}
+
+bool ApiClient::ensure_sse(char* err, size_t err_len)
+{
+    if (_sse != nullptr) return true;
+    _sse = new sse::Parser(&ApiClient::on_sse_event, this);
+    if (_sse == nullptr) {
+        if (err && err_len > 0) snprintf(err, err_len, "%s", "не хватило памяти на парсер");
+        return false;
+    }
     return true;
 }
 
@@ -195,6 +219,13 @@ void ApiClient::handle_event(const char* data, size_t len)
     // Склеивать обязательно: короткий вызов приезжает за десяток дельт (Р-025).
     if (_calls != nullptr) _calls->feed(data, len);
 
+    // Источники веб-поиска (Р-036). Обычно приходят одним чанком, но
+    // накопитель дедуплицирует по URL — полагаться на «одним чанком» нельзя.
+    if (_sources != nullptr) {
+        if (!_sources_seen && web::mentions_annotations(data, len)) _sources_seen = true;
+        web::feed(data, len, *_sources);
+    }
+
     if (chunk.has_finish) {
         snprintf(_finish_reason, sizeof(_finish_reason), "%s", chunk.finish_reason);
     }
@@ -225,22 +256,49 @@ void ApiClient::begin_connect()
     _reasoning_tokens = 0;
     _http_code = 0;
 
-    _client = new NetworkClientSecure();
-    if (_client == nullptr) {
-        fail("не хватило памяти на соединение");
-        return;
-    }
-
-    _client->setHandshakeTimeout(kConnectTimeoutMs / 1000);
+    // Тип клиента — по схеме адреса. `http://` разрешён валидацией настроек и
+    // нужен для проверки на своём сервере; TLS-клиент на обычном порту просто
+    // не смог бы соединиться, и это выглядело бы как «сервер недоступен».
+    //
+    // Указатели РАЗДЕЛЬНЫЕ, и это не придирка: у NetworkClient деструктор не
+    // виртуальный (`~NetworkClient();`), поэтому `delete` TLS-объекта через
+    // базовый указатель — неопределённое поведение, а на практике деструктор
+    // NetworkClientSecure не вызовется и TLS-контекст утечёт. В тесной
+    // внутренней RAM платы такая утечка на каждом запросе кончилась бы
+    // отказом соединений.
     if (_tls) {
+        _tls_client = new NetworkClientSecure();
+        if (_tls_client == nullptr) {
+            fail("не хватило памяти на соединение");
+            return;
+        }
         // Проверяем сертификат по встроенному набору корневых CA. Без проверки
         // любой посредник читал бы ключ API в открытом виде.
-        _client->useBuiltinCACertBundle();
+        _tls_client->setHandshakeTimeout(kConnectTimeoutMs / 1000);
+        _tls_client->useBuiltinCACertBundle();
+        _tls_client->setConnectionTimeout(kConnectTimeoutMs);
+    } else {
+        _plain_client = new NetworkClient();
+        if (_plain_client == nullptr) {
+            fail("не хватило памяти на соединение");
+            return;
+        }
+        _plain_client->setConnectionTimeout(kConnectTimeoutMs);
     }
 
     _http = new HTTPClient();
     if (_http == nullptr) {
         fail("не хватило памяти на HTTP-клиент");
+        return;
+    }
+
+    // Парсер мог быть удалён teardown() перед повтором, а ответ на этот раз
+    // может прийти успешный — тогда его надо разбирать. Раньше повтор уходил с
+    // пустым телом, до разбора дело не доходило, и отсутствие парсера не
+    // проявлялось (Р-042).
+    char sse_err[64];
+    if (!ensure_sse(sse_err, sizeof(sse_err))) {
+        fail(sse_err);
         return;
     }
 
@@ -257,7 +315,8 @@ void ApiClient::begin_connect()
     static const char* kCollected[] = {"Transfer-Encoding", "Content-Type", "Retry-After"};
     _http->collectHeaders(kCollected, 3);
 
-    if (!_http->begin(*_client, _host, _port, _path, _tls)) {
+    NetworkClient* client = _tls ? static_cast<NetworkClient*>(_tls_client) : _plain_client;
+    if (!_http->begin(*client, _host, _port, _path, _tls)) {
         fail("не удалось начать соединение");
         return;
     }
@@ -272,17 +331,23 @@ void ApiClient::begin_connect()
 
     const int code = _http->POST(reinterpret_cast<uint8_t*>(_body), _body_len);
 
-    // Тело запроса больше не нужно, а занимает десятки килобайт PSRAM.
-    free(_body);
-    _body = nullptr;
-    _body_len = 0;
-
     if (code <= 0) {
+        // Тело больше не понадобится: повторять ошибку сети нечем — она
+        // приходит до отправки, и `schedule_retry` здесь не вызывается.
+        free(_body);
+        _body = nullptr;
+        _body_len = 0;
         char text[160];
         snprintf(text, sizeof(text), "сеть: %s", _http->errorToString(code).c_str());
         fail(text);
         return;
     }
+
+    // Тело освобождает только finish(): при 429/5xx будет повтор, и ему нужен
+    // тот же запрос. Раньше `free(_body)` стоял прямо здесь, и вторая попытка
+    // отправляла ПУСТОЕ тело — сервер отвечал 400, а пользователь видел
+    // «сервер отклонил запрос» вместо повтора. Найдено на фальшивом сервере
+    // (scripts/fake_api.py): в логе вторая попытка приходила с `ключи: `.
 
     if (code >= 400) {
         // Тело ошибки маленькое (сотни байт) и приходит с Content-Length.
@@ -366,6 +431,10 @@ void ApiClient::handle_full_response()
 
     if (parsed) {
         if (_calls != nullptr) _calls->feed(body.c_str(), body.length());
+        if (_sources != nullptr) {
+            if (!_sources_seen && web::mentions_annotations(body.c_str(), body.length())) _sources_seen = true;
+            web::feed(body.c_str(), body.length(), *_sources);
+        }
         if (chunk.has_reasoning && _listener != nullptr) _listener->on_reasoning(reasoning, chunk.reasoning_len);
         if (chunk.has_text && _listener != nullptr) _listener->on_text(text, chunk.text_len);
         if (chunk.has_finish) snprintf(_finish_reason, sizeof(_finish_reason), "%s", chunk.finish_reason);
@@ -470,10 +539,15 @@ void ApiClient::teardown()
         delete _http;
         _http = nullptr;
     }
-    if (_client != nullptr) {
-        _client->stop();
-        delete _client;
-        _client = nullptr;
+    if (_tls_client != nullptr) {
+        _tls_client->stop();
+        delete _tls_client;
+        _tls_client = nullptr;
+    }
+    if (_plain_client != nullptr) {
+        _plain_client->stop();
+        delete _plain_client;
+        _plain_client = nullptr;
     }
     delete _sse;
     _sse = nullptr;
@@ -486,6 +560,12 @@ void ApiClient::teardown()
 
 bool ApiClient::schedule_retry(int http_code, unsigned long* out_delay_ms)
 {
+    // Лимит трат по ключу тоже приходит как 429, но повторять его бессмысленно:
+    // пауза не вернёт деньги, а пользователь получит полминуты ожидания и то
+    // же самое. Отличить помогает текст тела (Р-036, найденный на плате
+    // дефект: устройство дважды повторяло запрос при исчерпанном ключе).
+    if (api::quota_exhausted(http_code, _error_body, _error_body_len)) return false;
+
     // 429 — «слишком часто», 5xx — сбой на стороне сервера. 4xx кроме 429
     // повторять бессмысленно: запрос сам по себе неверен (ключ, модель, JSON),
     // и вторая попытка даст тот же ответ.
@@ -546,6 +626,14 @@ void ApiClient::finish(State state)
         // слушатель ещё не решил, что ответ закончен. Ориентироваться на
         // finish_reason нельзя: наблюдали и "stop" при непустом наборе.
         if (_calls != nullptr && _calls->any()) _listener->on_tool_calls(*_calls);
+
+        // Источники — тоже до on_finished: к этому моменту список собран, а
+        // слушатель ещё не решил, что ответ закончен.
+        //
+        // Вызываем и при пустом списке, если поле `annotations` в ответе было:
+        // «поиск ничего не нашёл» — это не то же самое, что «поиска не было»,
+        // и экран должен сказать об этом словами, а не молчанием.
+        if (_sources != nullptr && (_sources->count > 0 || _sources_seen)) _listener->on_web_sources(*_sources);
 
         // finish_reason мог не прийти, если поток закрылся без него: считаем
         // ответ завершённым нормально. Обрыв отличается тем, что слушатель

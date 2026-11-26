@@ -24,11 +24,13 @@
 #include "util/chunked.h"
 #include "util/sse.h"
 #include "util/tool_calls.h"
+#include "util/web_sources.h"
 
 /// Сетевые типы Arduino скрыты за указателями: иначе заголовок пришлось бы
 /// включать в каждый экран, который знает про клиент. Объявлены в глобальной
 /// области, как и в библиотеках Arduino, — внутри namespace hw это были бы
 /// другие типы, и компилятор не смог бы их удалить.
+class NetworkClient;
 class NetworkClientSecure;
 class HTTPClient;
 class NetworkClient;
@@ -85,6 +87,18 @@ public:
         /// инструменты сам (Р-026).
         virtual void on_tool_calls(const tools::Accumulator& calls) { (void)calls; }
 
+        /// Источники веб-поиска из `annotations` (Р-036).
+        ///
+        /// Вызывается ДО on_finished(), как и on_tool_calls: список полон
+        /// только к концу потока, а слушатель до этого момента не знает, что
+        /// ответ закончен. Живёт до следующего start() — копировать сразу.
+        ///
+        /// Вызывается, только если источники есть: «поиска не было» и «поиск
+        /// ничего не нашёл» различаются тем, что в первом случае вызова нет
+        /// вовсе, а во втором есть поле `annotations` с пустым массивом —
+        /// его видно через web::mentions_annotations().
+        virtual void on_web_sources(const web::List& sources) { (void)sources; }
+
         /// Ошибка. Текст уже человекочитаемый.
         virtual void on_error(const char* message) = 0;
 
@@ -136,6 +150,17 @@ public:
     /// HTTP-код последнего ответа (0 — ответа не было).
     int http_code() const { return _http_code; }
 
+    /// Источники веб-поиска последнего ответа. Живут до следующего start().
+    ///
+    /// Отдельный доступ нужен, потому что «поиск ничего не нашёл» — это не
+    /// пустой список, а ответ с полем `annotations` и пустым массивом; такое
+    /// видно только здесь, в колбэк оно не попадает.
+    const web::List& web_sources() const { return _sources != nullptr ? *_sources : _empty_sources; }
+
+    /// Был ли в ответе хоть один блок `annotations`. false — поиск не
+    /// выполнялся вовсе (плагин выключен или модель не сочла нужным искать).
+    bool web_search_ran() const { return _sources_seen; }
+
 private:
     /// Обработчик одного события SSE из парсера. Статический, потому что
     /// util/sse не знает про классы.
@@ -159,6 +184,17 @@ private:
     /// Подключиться и отправить запрос. Вызывается из tick(), чтобы экран не
     /// замирал на время TLS-рукопожатия.
     void begin_connect();
+
+    /// Создать SSE-парсер, если его нет.
+    ///
+    /// Нужен на каждой попытке, а не один раз в start(): перед повтором
+    /// teardown() удаляет парсер вместе с соединением. Раньше повтор уходил с
+    /// пустым телом и до разбора не доходил, поэтому отсутствие парсера не
+    /// проявлялось (Р-042).
+    /// @param err буфер для причины отказа
+    /// @param err_len размер буфера
+    /// @return false, если памяти не хватило
+    bool ensure_sse(char* err, size_t err_len);
     /// Разобрать ответ, пришедший не потоком (сервер проигнорировал stream).
     void handle_full_response();
 
@@ -175,8 +211,14 @@ private:
     sse::Parser* _sse{nullptr};
     http::ChunkedDecoder _chunked{&ApiClient::on_chunk_data, this};
 
-    /// Соединение и HTTP-объект. Живут от start() до finish().
-    NetworkClientSecure* _client{nullptr};
+    /// Соединения и HTTP-объект. Живут от start() до finish().
+    ///
+    /// Два указателя, а не один базовый: `http://` в адресе API разрешён и
+    /// нужен для проверки на своём сервере, но у NetworkClient деструктор не
+    /// виртуальный. `delete` TLS-объекта через базовый указатель не вызвал бы
+    /// ~NetworkClientSecure и утёк бы TLS-контекстом на каждом запросе.
+    NetworkClientSecure* _tls_client{nullptr};
+    NetworkClient* _plain_client{nullptr};
     HTTPClient* _http{nullptr};
 
     /// Буфер тела запроса: тело с историей легко достигает десятков килобайт,
@@ -189,6 +231,17 @@ private:
     /// 8 вызовов по 2 КБ аргументов — 16 КБ, поэтому он в PSRAM: на стеке
     /// задачи интерфейса столько нет.
     tools::Accumulator* _calls{nullptr};
+
+    /// Источники веб-поиска, накопленные из `annotations` за ответ.
+    ///
+    /// Пять источников по ~600 байт — 3 КБ; на стеке задачи интерфейса это
+    /// слишком дорого, а в куче по умолчанию отнимает место у TLS. PSRAM.
+    web::List* _sources{nullptr};
+    /// Было ли в ответе поле `annotations` хоть раз. Отличает «поиск ничего
+    /// не нашёл» от «поиска не было».
+    bool _sources_seen{false};
+    /// Пустой список на случай, если память под источники не выделилась.
+    web::List _empty_sources{};
 
     /// Ответ приходит с `Transfer-Encoding: chunked` (обычный случай для SSE).
     /// Если сервер отдал Content-Length, чанки разбирать нельзя: JSON в этом

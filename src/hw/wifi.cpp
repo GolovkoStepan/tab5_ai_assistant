@@ -47,6 +47,7 @@ bool WifiManager::begin()
     for (int attempt = 0; attempt < 3; ++attempt) {
         if (WiFi.mode(WIFI_STA)) {
             _begun = true;
+            _radio_on = true;
             break;
         }
         ESP_LOGW(kTag, "WiFi.mode(STA) не удался, попытка %d", attempt + 1);
@@ -75,7 +76,7 @@ bool WifiManager::begin()
 
 bool WifiManager::start_scan()
 {
-    if (!_begun) return false;
+    if (!_begun || !_radio_on) return false;
 
     // Асинхронный скан: метод возвращает -1, а результат забираем по
     // scanComplete() в tick(). Синхронный вариант держал бы UI секунды.
@@ -131,7 +132,9 @@ void WifiManager::clear_scan()
 
 bool WifiManager::start_connect(const char* ssid, const char* password)
 {
-    if (!_begun || !ssid || ssid[0] == '\0') return false;
+    // Радио выключено командой — подключение не запустится, и состояние
+    // осталось бы «Connecting» до таймаута. Говорим об этом сразу.
+    if (!_begun || !_radio_on || !ssid || ssid[0] == '\0') return false;
 
     // Открытая сеть: пароль пустой — это нормально, а не ошибка ввода.
     // Проверяем длину только если пароль задан.
@@ -223,6 +226,55 @@ void WifiManager::disconnect()
     set_state(State::Idle);
     _ssid[0] = '\0';
     snprintf(_ip, sizeof(_ip), "%s", "—");
+}
+
+bool WifiManager::power_off()
+{
+    if (!_begun) return false;
+
+    // Автопереподключение выключаем ДО остановки: иначе событие «связь
+    // потеряна» успело бы запустить новое подключение прямо в момент отказа.
+    WiFi.setAutoReconnect(false);
+    _radio_on = false;
+
+    // WIFI_OFF останавливает и стек, и драйвер C6 — связь не вернётся сама.
+    // disconnect() для этого не годится: он рвёт соединение, а автопере-
+    // подключение тут же поднимает новое, и «сети нет» проверить нельзя.
+    if (!WiFi.mode(WIFI_OFF)) {
+        ESP_LOGW(kTag, "радио не выключилось");
+        _radio_on = true;
+        WiFi.setAutoReconnect(true);
+        return false;
+    }
+
+    set_state(State::Idle);
+    _ssid[0] = '\0';
+    snprintf(_ip, sizeof(_ip), "%s", "—");
+    ESP_LOGW(kTag, "радио выключено командой (диагностика)");
+    return true;
+}
+
+bool WifiManager::power_on(uint32_t* elapsed_ms)
+{
+    const uint32_t t0 = millis();
+    // Повторяем, как в begin(): первый WiFi.mode() после остановки снова
+    // поднимает SDIO к C6, и с первого раза это иногда не выходит.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (WiFi.mode(WIFI_STA)) {
+            WiFi.setSleep(false);
+            WiFi.setAutoReconnect(true);
+            _begun = true;
+            _radio_on = true;
+            update_ip();
+            if (elapsed_ms != nullptr) *elapsed_ms = millis() - t0;
+            ESP_LOGI(kTag, "радио включено командой");
+            return true;
+        }
+        ESP_LOGW(kTag, "радио не включилось, попытка %d", attempt + 1);
+        delay(300);
+    }
+    if (elapsed_ms != nullptr) *elapsed_ms = millis() - t0;
+    return false;
 }
 
 void WifiManager::set_state(State s)

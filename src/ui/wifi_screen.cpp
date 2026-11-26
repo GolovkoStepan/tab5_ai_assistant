@@ -76,6 +76,20 @@ void WifiScreen::onEnter()
     _password_len = 0;
     _target_ssid[0] = '\0';
 
+    // Радио могло быть выключено командой `wifi off` по Serial. Экран — это
+    // то место, где человек ищет сеть, поэтому здесь же её и включаем: иначе
+    // `Ctrl+W` открывался бы с «радио не отвечает», а вернуть связь осталось
+    // бы только командой, которую надо помнить.
+    //
+    // Сам подъём драйвера — работа tick(), а не onEnter: на плате он занимает
+    // ~2.3 с (остановка и повторный подъём SDIO к C6), и делать это до первой
+    // отрисовки значило бы заморозить предыдущий экран без объяснения. Тот же
+    // приём, что на заставке (Р-035): сначала надпись, потом пауза.
+    if (!_wifi->radio_on()) {
+        enter_mode(Mode::PowerUp);
+        return;
+    }
+
     // Скан при входе запускаем всегда: список нужен и когда уже подключены,
     // иначе выбрать другую сеть нельзя.
     //
@@ -98,6 +112,14 @@ void WifiScreen::onExit()
     _password_len = 0;
     _target_ssid[0] = '\0';
     _error[0] = '\0';
+    // Выход из экрана отменяет наше решение подключиться: иначе неудача
+    // автоподключения обработалась бы уже при следующем входе, поверх
+    // свежего скана.
+    _auto_reconnect = false;
+    _user_connect = false;
+    // Ушли до окончания подъёма радио — включать его больше не нужно: экран
+    // закрыт. Следующий вход снова покажет «включаю радио…».
+    if (_mode == Mode::PowerUp) _mode = Mode::Scanning;
 }
 
 void WifiScreen::enter_mode(Mode m)
@@ -106,6 +128,9 @@ void WifiScreen::enter_mode(Mode m)
     _mode = m;
     _redraw_all = true;
     _error[0] = '\0';
+    // Кадр «включаю радио…» рисуется заново при каждом входе в режим, и ждать
+    // драйвер можно только после него.
+    _powerup_shown = false;
 }
 
 void WifiScreen::start_scan()
@@ -140,6 +165,7 @@ bool WifiScreen::onKey(const hw::KeyEvent& ev)
             if (_mode == Mode::Connecting) {
                 _wifi->disconnect();
                 _user_connect = false;
+                _auto_reconnect = false;
             }
             _password[0] = '\0';
             _password_len = 0;
@@ -151,6 +177,11 @@ bool WifiScreen::onKey(const hw::KeyEvent& ev)
 
     switch (_mode) {
     case Mode::Password: handle_password_key(ev); return false;
+
+    // Пока радио включается, клавиши не действуют: список ещё не готов.
+    // Esc обработан выше и просто закрывает экран — подъём отменится вместе
+    // с ним (см. onExit).
+    case Mode::PowerUp: return false;
 
     case Mode::List:
     case Mode::Scanning:
@@ -310,6 +341,33 @@ void WifiScreen::tick()
 {
     if (!_wifi) return;
 
+    // Радио включаем только после того, как экран показал «включаю радио…»:
+    // подъём драйвера занимает ~2.3 с, и начинать его до отрисовки значило бы
+    // заморозить предыдущий экран без объяснения (тот же приём, что на
+    // заставке, Р-035). Флаг ставит draw(), а не таймер: ждём именно кадр.
+    if (_mode == Mode::PowerUp && _powerup_shown) {
+        uint32_t elapsed = 0;
+        if (!_wifi->power_on(&elapsed)) {
+            enter_mode(Mode::List);
+            fail("Радио не включилось — «wifi on» по Serial");
+            return;
+        }
+        Serial.printf("Wi-Fi: радио включено на входе в экран за %lu мс\n", static_cast<unsigned long>(elapsed));
+
+        // Сохранённая сеть уже известна — не заставляем выбирать её заново.
+        // Неудачу обработаем ниже, когда драйвер закончит подключение.
+        if (_settings != nullptr && _settings->has_wifi()) {
+            _auto_reconnect = true;
+            _wifi->auto_connect(_settings->secrets());
+        }
+        if (_wifi->connecting()) {
+            enter_mode(Mode::Connecting);
+            return;
+        }
+        start_scan();
+        return;
+    }
+
     // Скан завершился — забираем результат. Работает независимо от того,
     // виден экран или нет: tick() вызывается всегда.
     if (_scan_pending) {
@@ -341,12 +399,27 @@ void WifiScreen::tick()
             // затёрла бы рабочий пароль пустой строкой.
             if (_user_connect) save_after_connect();
             _user_connect = false;
+            _auto_reconnect = false;
             enter_mode(Mode::List);
+            // После включения радио мы вернулись до скана, поэтому списка нет.
+            // Без него экран показывал бы пустоту до повторного входа.
+            if (_list.count == 0) start_scan();
         } else if (_wifi->state() == hw::WifiManager::State::Failed) {
             // Стираем пароль: если он неверный, повторять его бессмысленно.
             _password[0] = '\0';
             _password_len = 0;
             _user_connect = false;
+            if (_auto_reconnect) {
+                // Пароля никто не вводил — подключение запустил сам экран
+                // после включения радио. Тогда некуда возвращаться в поле
+                // пароля: показываем список сетей и говорим, что не вышло.
+                // Список пересобираем: до этого скана не было, и он пуст.
+                _auto_reconnect = false;
+                _selected = 0;
+                start_scan();
+                fail("Сохранённая сеть не ответила — выберите другую");
+                return;
+            }
             enter_mode(Mode::Password);
             fail("Не удалось. Проверьте пароль");
         } else {
@@ -390,6 +463,13 @@ void WifiScreen::draw()
         draw_hints();
 
         switch (_mode) {
+        case Mode::PowerUp:
+            // Надпись честная: подъём драйвера C6 — самая долгая часть входа
+            // на этот экран, и молчать про неё нельзя.
+            ui::text("Включаю радио…", kMargin, kListY + 20, TFT_WHITE);
+            ui::text("Подъём драйвера C6 занимает около двух секунд", kMargin, kListY + 48, kColorDim);
+            _powerup_shown = true;
+            break;
         case Mode::Scanning: ui::text("Ищу сети…", kMargin, kListY + 20, TFT_WHITE); break;
         case Mode::List: draw_list(); break;
         case Mode::Password:
@@ -615,6 +695,7 @@ void WifiScreen::draw_hints()
 {
     const char* hint = "";
     switch (_mode) {
+    case Mode::PowerUp: hint = "Включение радио… · Esc — назад"; break;
     case Mode::Scanning: hint = "Идёт скан сетей…"; break;
     case Mode::List: hint = "↑ ↓ — выбор · Enter — подключиться · Del — искать заново · Esc — назад"; break;
     case Mode::Password: hint = "Введите пароль · Enter — подключиться · Esc — назад"; break;

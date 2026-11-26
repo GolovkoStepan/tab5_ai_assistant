@@ -24,6 +24,7 @@
 #include "util/chat_measure.h"
 #include "util/chat_view.h"
 #include "util/format.h"
+#include "util/markdown.h"
 
 namespace ui {
 namespace {
@@ -85,6 +86,12 @@ constexpr const char* kSystemPrompt =
     "Не выдумывай факты: если не уверен — прямо скажи об этом. "
     "Не используй эмодзи и другие пиктограммы: шрифт экрана их не поддерживает, "
     "вместо них рисуются пустые квадраты. "
+    // Разметку экран не понимает: markdown-звено «[mi.com](https://…)" видно
+    // человеку как скобки и сырой адрес. Список источников устройство дописывает
+    // к ответу само, поэтому модель, перечисляя ссылки, дублировала его — в треде
+    // это выглядело двумя блоками «Источники:» подряд (проверено 26.11.2026).
+    "Не используй markdown-разметку: ни выделения, ни ссылок вида [текст](адрес). "
+    "Не перечисляй источники сам — устройство добавляет список ссылок к ответу автоматически. "
     "У тебя есть архив документов на устройстве (инструменты list_docs, read_doc, "
     "search_docs, write_doc, delete_doc). Перед ответом на вопрос про бытовую технику, "
     "настройки приборов или инструкции сначала поищи в архиве: возможно, ответ там уже "
@@ -94,9 +101,18 @@ constexpr const char* kSystemPrompt =
 constexpr uint16_t kColorUser = TFT_CYAN;
 constexpr uint16_t kColorAssistant = 0x07E0;  // зелёный
 constexpr uint16_t kColorPartial = TFT_ORANGE;
+
 constexpr uint16_t kColorDim = TFT_LIGHTGRAY;
 constexpr uint16_t kColorFaint = TFT_DARKGRAY;
 constexpr uint16_t kColorFrame = 0x18E3;
+
+// Ошибка и подсказка раньше рисовались одинаково — одна оранжевая строка.
+// Из-за этого отказ сервера («Лимит трат по ключу исчерпан…») читался как
+// обычное «введите вопрос», и владелец не понял, что случилось.
+// Теперь у ошибки тёмно-красная подложка на всю ширину и белый текст: её видно
+// боковым зрением, не вычитывая буквы. Подсказка осталась тихой.
+constexpr uint16_t kColorError = TFT_WHITE;
+constexpr uint16_t kColorErrorBg = 0x7800;  // TFT_MAROON
 
 /// Подпись роли для ленты.
 const char* role_label(api::Role role, bool partial)
@@ -124,20 +140,38 @@ uint16_t role_color(api::Role role, bool partial)
 /// markdown вместо своих вопросов. Показываем одну строку: имя инструмента и
 /// начало результата. Модели при этом уходит полный текст — в запрос он
 /// берётся из треда, а не отсюда.
-const char* shown_text(const hw::ChatMessage& m, char* buf, size_t cap)
+///
+/// У ответов модели снимается markdown-разметка (`md::plain`): экран её не
+/// понимает, и `[mi.com](https://…)` читался как скобки и сырой адрес.
+/// Чистим только показ — в треде и в истории запроса текст остаётся исходным.
+const char* shown_text(const hw::ChatMessage& m)
 {
-    if (m.role != api::Role::Tool || m.content == nullptr) return m.content != nullptr ? m.content : "";
+    // Буфер под разметку нужен размером с сообщение: длинный ответ не влез бы
+    // в общий 1 КБ буфер строки, а обрезанный вернул бы пустоту — сообщение
+    // исчезло бы из ленты. Статический: 12 КБ на стеке задачи интерфейса
+    // недопустимы.
+    static char cleaned[hw::ChatStore::kMaxContentBytes + 1];
 
-    // Первая строка результата: для ответов вида «Создан документ home/x.md»
-    // это и есть весь смысл.
-    size_t n = 0;
-    while (m.content[n] != '\0' && m.content[n] != '\n' && m.content[n] != '\r' && n + 1 < cap)
-        ++n;
+    if (m.role == api::Role::Tool && m.content != nullptr) {
+        // Первая строка результата: для ответов вида «Создан документ home/x.md»
+        // это и есть весь смысл.
+        static char one_line[256];
+        size_t n = 0;
+        while (m.content[n] != '\0' && m.content[n] != '\n' && m.content[n] != '\r' && n + 1 < sizeof(one_line))
+            ++n;
 
-    const int written = snprintf(buf, cap, "%s · %.*s%s", m.name[0] != '\0' ? m.name : "инструмент",
-        static_cast<int>(n), m.content, m.content[n] == '\0' ? "" : " …");
-    (void)written;
-    return buf;
+        snprintf(one_line, sizeof(one_line), "%s · %.*s%s", m.name[0] != '\0' ? m.name : "инструмент",
+            static_cast<int>(n), m.content, m.content[n] == '\0' ? "" : " …");
+        return one_line;
+    }
+
+    if (m.content == nullptr) return "";
+    if (!md::needed(m.content, m.content_len)) return m.content;
+
+    // Не поместилось (не должно: разметка только сокращает текст) — показываем
+    // как есть. Потерять сообщение хуже, чем показать его с разметкой.
+    if (md::plain(m.content, m.content_len, cleaned, sizeof(cleaned)) == 0) return m.content;
+    return cleaned;
 }
 
 bool is_char(const hw::KeyEvent& ev)
@@ -182,12 +216,43 @@ public:
     void on_retry(int attempt, int delay_s) override { _screen->on_answer_retry(attempt, delay_s); }
     void on_error(const char* message) override { _screen->on_answer_error(message); }
     void on_tool_calls(const tools::Accumulator& calls) override { _screen->on_tool_calls(calls); }
+    void on_web_sources(const web::List& sources) override { _screen->on_web_sources(sources); }
 
 private:
     ChatScreen* _screen;
 };
 
 AnswerSink* g_sink = nullptr;
+
+/// Слушатель поискового подзапроса (Р-040).
+///
+/// Отдельный от AnswerSink: события поиска идут в СВОЙ буфер, а не в ленту —
+/// открытой реплики ассистента в этот момент нет, и текст поисковика не должен
+/// попасть в тред. Источники копятся тоже отдельно, а в общий список экрана
+/// они переезжают в finish_search(): только тогда видно, что принёс именно
+/// этот поиск.
+class SearchSink : public hw::ApiClient::Listener {
+public:
+    explicit SearchSink(ChatScreen* screen) : _screen(screen) {}
+
+    void on_text(const char* text, size_t len) override { _screen->on_search_text(text, len); }
+    void on_usage(long input_tokens, long output_tokens, long) override
+    {
+        _screen->on_search_usage(input_tokens, output_tokens);
+    }
+    void on_finished(const char* reason) override { _screen->on_search_finished(reason); }
+    void on_retry(int attempt, int delay_s) override { _screen->on_search_retry(attempt, delay_s); }
+    void on_error(const char* message) override { _screen->on_search_error(message); }
+    // Источники идут в общий список хода: он один на ход, дедуплицирует по URL,
+    // и в конце именно из него собирается блок «Источники:» и `source_url`
+    // заметки. Отдельный список дал бы два источника правды.
+    void on_web_sources(const web::List& sources) override { _screen->on_web_sources(sources); }
+
+private:
+    ChatScreen* _screen;
+};
+
+SearchSink* g_search_sink = nullptr;
 
 }  // namespace
 
@@ -229,6 +294,14 @@ void ChatScreen::init(
     _calls_json = static_cast<char*>(heap_caps_malloc(kCallsJsonCap, MALLOC_CAP_SPIRAM));
     if (_calls_json == nullptr) _calls_json = static_cast<char*>(malloc(kCallsJsonCap));
 
+    // 64 байта — можно и на стеке, но буфер живёт весь сеанс: пусть лежит
+    // рядом с остальными в PSRAM, чтобы не путать источники выделения.
+    // 4 КБ — можно и на стеке, но буфер живёт весь сеанс: пусть лежит
+    // рядом с остальными в PSRAM, чтобы не путать источники выделения.
+    _search_body = static_cast<char*>(heap_caps_malloc(kSearchBodyCap, MALLOC_CAP_SPIRAM));
+    if (_search_body == nullptr) _search_body = static_cast<char*>(malloc(kSearchBodyCap));
+    if (_search_body != nullptr) _search_body[0] = '\0';
+
     _tool_out = static_cast<char*>(heap_caps_malloc(tools::kMaxResultBytes + 1, MALLOC_CAP_SPIRAM));
     if (_tool_out == nullptr) _tool_out = static_cast<char*>(malloc(tools::kMaxResultBytes + 1));
 
@@ -245,9 +318,26 @@ void ChatScreen::init(
         static_cast<docapi::Hit*>(static_cast<void*>(heap_caps_malloc(16 * sizeof(docapi::Hit), MALLOC_CAP_SPIRAM)));
     if (_doc_hits == nullptr) _doc_hits = static_cast<docapi::Hit*>(malloc(16 * sizeof(docapi::Hit)));
 
+    // Источники веб-поиска: пять записей по ~600 байт — тоже только в PSRAM.
+    _web_sources = static_cast<web::List*>(static_cast<void*>(heap_caps_malloc(sizeof(web::List), MALLOC_CAP_SPIRAM)));
+    if (_web_sources == nullptr) _web_sources = static_cast<web::List*>(malloc(sizeof(web::List)));
+    if (_web_sources != nullptr) new (_web_sources) web::List();
+
+    // Текст поискового подзапроса (Р-040). 4 КБ — столько хватает на пересказ
+    // в тысячу символов с большим запасом; в PSRAM, рядом с остальными.
+    _search_text = static_cast<char*>(heap_caps_malloc(kSearchTextCap, MALLOC_CAP_SPIRAM));
+    if (_search_text == nullptr) _search_text = static_cast<char*>(malloc(kSearchTextCap));
+    if (_search_text != nullptr) _search_text[0] = '\0';
+
     doctools::register_all(_tools);
+    wsearch::register_tool(_tools);
     if (_tools_json != nullptr) {
-        if (!_tools.build_tools_json(_tools_json, kToolsJsonCap)) {
+        // Учитываем настройку сразу: если поиск выключен в config.json, при
+        // загрузке схема не должна содержать `web_search` — иначе модель звала
+        // бы его до первого переключения в Ctrl+A, и мы платили бы за поиск,
+        // который пользователь выключил.
+        const bool search_on = _settings->config().search_enabled;
+        if (!_tools.build_tools_json(_tools_json, kToolsJsonCap, search_on ? nullptr : "web_search")) {
             // Не влезли — работаем без инструментов: чат важнее агента, и
             // молчаливое «модель не умеет искать» лучше, чем отказ экрана.
             Serial.println("Агент: схемы инструментов не поместились, работаем без них");
@@ -257,6 +347,7 @@ void ChatScreen::init(
                 "Агент: %u инструментов, схемы %u байт\n", (unsigned)_tools.count(), (unsigned)strlen(_tools_json));
         }
     }
+    _tools_search_on = _settings->config().search_enabled;
 }
 
 void ChatScreen::onEnter()
@@ -428,6 +519,10 @@ void ChatScreen::fail(const char* text)
     snprintf(_error, sizeof(_error), "%s", text);
     _failed = true;
     _redraw_error = true;
+    // В монитор — с префиксом: по жалобе «вылезла непонятная ошибка» нужно
+    // видеть, что именно пришло от сервера. Экран показывает текст, но не
+    // сохраняет его в тред, а Serial остаётся при владельце.
+    Serial.printf("Чат: ошибка — %s\n", _error);
 }
 
 void ChatScreen::notice(const char* text)
@@ -441,11 +536,11 @@ void ChatScreen::fill_model_status(led::Status& s) const
 {
     // Подтверждение — не «модель работает»: светодиод не должен гореть синим,
     // пока ждём решения человека.
-    s.busy = _mode == Mode::Sending || _mode == Mode::Streaming;
+    s.busy = _mode == Mode::Sending || _mode == Mode::Streaming || _mode == Mode::Searching;
     s.streaming = _mode == Mode::Streaming;
     // Пауза перед повтором: счётчик уже сброшен при выходе из Sending, но
     // пока идёт обратный отсчёт, режим всё ещё Sending.
-    s.retrying = _mode == Mode::Sending && _retry_delay_s > 0;
+    s.retrying = (_mode == Mode::Sending || _mode == Mode::Searching) && _retry_delay_s > 0;
     s.error = _failed;
 }
 
@@ -515,10 +610,12 @@ bool ChatScreen::onKey(const hw::KeyEvent& ev)
             // пользователя давно в середине треда, и последним лежит
             // результат инструмента. Получилось бы «вопрос остался без
             // ответа» на ровном месте.
-            const bool agent_turn = _agent_pending || _agent_step > 0;
+            const bool agent_turn = _agent_pending || _search_pending || _agent_step > 0;
             _have_calls = false;
             _turn_ended = false;
             _agent_pending = false;
+            _search_pending = false;
+            _search_ended = false;
             _confirm_index = static_cast<size_t>(-1);
 
             if (agent_turn) {
@@ -539,6 +636,10 @@ bool ChatScreen::onKey(const hw::KeyEvent& ev)
                 // Незавершённая пустая реплика модели осталась бы в ленте
                 // подписью «модель» без текста. Убираем её.
                 if (last != nullptr && last->role == api::Role::Assistant) _store->drop_last();
+                // Ход брошен — итог поиска в статусе («поиск не удался») врал
+                // бы: поиск не провалился, его просто прервали.
+                _web_search_ran = false;
+                _web_search_failed = false;
                 enter_mode(Mode::Idle);
                 notice("Агент прерван, выполненные шаги сохранены");
                 _redraw_feed = true;
@@ -697,6 +798,38 @@ bool ChatScreen::onTouch(int x, int y)
 
 // --- Отправка ---------------------------------------------------------------
 
+/// Отправить вопрос, пришедший извне (команда `ask` по Serial).
+///
+/// Путь тот же, что у набранного текста: кладём в буфер ввода и зовём
+/// send_question(). Отдельной ветки отправки нет намеренно — иначе проверки
+/// «нет Wi-Fi», «нет ключа», «идёт ответ» пришлось бы повторять, и они бы
+/// разъехались.
+bool ChatScreen::ask(const char* text, size_t len)
+{
+    if (text == nullptr || len == 0) {
+        notice("Пустой вопрос");
+        return false;
+    }
+    if (_mode != Mode::Idle) {
+        notice("Дождитесь ответа или нажмите Esc");
+        return false;
+    }
+    if (len >= sizeof(_input)) {
+        fail("Вопрос слишком длинный");
+        return false;
+    }
+
+    memcpy(_input, text, len);
+    _input[len] = '\0';
+    _input_len = len;
+    _redraw_input = true;
+
+    if (!send_question()) return false;
+
+    Serial.printf("Чат: вопрос из Serial, %u байт\n", static_cast<unsigned>(len));
+    return true;
+}
+
 bool ChatScreen::send_question()
 {
     if (_mode != Mode::Idle) return false;
@@ -705,7 +838,13 @@ bool ChatScreen::send_question()
         return false;
     }
     if (_wifi == nullptr || !_wifi->connected()) {
-        fail("Нет Wi-Fi: Ctrl+W — настройка сети");
+        // Радио могло быть выключено командой Serial: тогда «Ctrl+W» не
+        // поможет, и человек искал бы сеть в списке, которого не будет.
+        if (_wifi != nullptr && !_wifi->radio_on()) {
+            fail("Wi-Fi выключен: «wifi on» по Serial или Ctrl+W");
+        } else {
+            fail("Нет Wi-Fi: Ctrl+W — настройка сети");
+        }
         return false;
     }
     if (_settings == nullptr || _settings->secrets().api_key[0] == '\0') {
@@ -750,6 +889,20 @@ bool ChatScreen::send_question()
     _turn_ended = false;
     _confirm_index = static_cast<size_t>(-1);
     _dsml.reset();
+
+    // Поисковое состояние сбрасываем на новом ходу: недособранный текст
+    // прошлого поиска не должен попасть в результат следующего.
+    _search_pending = false;
+    _search_ended = false;
+    _search_text_len = 0;
+    _search_status[0] = '\0';
+    if (_search_text != nullptr) _search_text[0] = '\0';
+
+    // Источники — свои у каждого хода: прошлый ответ не должен подмешивать
+    // свои ссылки к новому вопросу.
+    if (_web_sources != nullptr) _web_sources->clear();
+    _web_search_ran = false;
+    _web_search_failed = false;
 
     const size_t body_len = build_body();
     if (body_len == 0) {
@@ -831,9 +984,27 @@ size_t ChatScreen::build_body()
     static const char* const kEffort[] = {"none", "low", "medium", "high"};
     opt.reasoning_effort = kEffort[cfg.reasoning_effort <= 3 ? cfg.reasoning_effort : 1];
 
+    // Настройка «Веб-поиск» меняется с экрана Ctrl+A во время сеанса, а схемы
+    // собраны в init(). Пересобираем при расхождении: иначе переключатель
+    // работал бы только после перезагрузки.
+    if (cfg.search_enabled != _tools_search_on && _tools_json != nullptr) {
+        _tools_search_on = cfg.search_enabled;
+        if (!_tools.build_tools_json(_tools_json, kToolsJsonCap, cfg.search_enabled ? nullptr : "web_search")) {
+            _tools_json[0] = '\0';
+        }
+    }
+
     // tools — в КАЖДОМ запросе, включая ходы с результатами инструментов: без
     // них модель иногда печатает внутреннюю разметку в текст (Р-025).
     opt.tools_json = (_tools_json != nullptr && _tools_json[0] != '\0') ? _tools_json : nullptr;
+
+    // Плагина `web` здесь НЕТ — ни в одном шаге (Р-040). Раньше он уходил в
+    // первом запросе хода, и сервер искал по тексту последней реплики всегда,
+    // независимо от того, нужен ли интернет: на «привет» он тоже искал и брал
+    // за это ~2,1 ₽ (замерено, Р-038 п. 5). Теперь поиск — обычный инструмент
+    // `web_search`, и плагин уходит только в поисковом подзапросе (см.
+    // begin_search()). «Привет» стоит ~0,02 ₽ вместо ~2,17 ₽.
+    opt.plugins_json = nullptr;
 
     return api::build_request(g_out, n, opt, _body, kBodyCap);
 }
@@ -918,6 +1089,16 @@ void ChatScreen::finish_answer(bool ok, const char* reason)
     char ts[32];
     now_iso(ts, sizeof(ts));
 
+    // Источники дописываем в текст ответа ДО сохранения: отдельная реплика
+    // system попала бы в историю запроса, и модель приняла бы список ссылок
+    // за собственные слова. Так они и в ленте, и в треде, и переживают
+    // перезагрузку.
+    append_web_sources();
+
+    // Итог хода в Serial: по нему проверяется приёмка, когда экран не перед
+    // глазами (прогон командой `ask`).
+    log_turn_result();
+
     if (!_store->finish_last(
             ts[0] != '\0' ? ts : nullptr, _answer.input_tokens, _answer.output_tokens, _answer.partial)) {
         _store->drop_last();
@@ -940,6 +1121,39 @@ void ChatScreen::finish_answer(bool ok, const char* reason)
     enter_mode(Mode::Idle);
     _redraw_feed = true;
     _redraw_status = true;
+}
+
+void ChatScreen::append_web_sources()
+{
+    if (_web_sources == nullptr) return;
+
+    // Поиск был, но ничего не нашёл: честнее сказать об этом, чем молчать —
+    // иначе выглядит, будто ассистент не умеет искать. Но только если поиск
+    // ДЕЙСТВИТЕЛЬНО отработал: «не смог» (сеть, отказ сервера, Esc) уже
+    // показан ошибкой, и подменять её «ничего не дал» нельзя.
+    if (_web_sources->count == 0) {
+        if (_web_search_ran && !_web_search_failed) {
+            const char* text = "\n\nПоиск в интернете не дал результатов.";
+            const size_t n = strlen(text);
+            if (append_answer(text, n) && _scroll == 0) _redraw_feed = true;
+        }
+        return;
+    }
+
+    // Сборка списка — в чистом util/web_sources: там она проверяется тестами на
+    // хосте, включая обрезку. Здесь только буфер и дописывание в тред.
+    //
+    // Буфер статический: 2.7 КБ при 8 КБ стека задачи интерфейса — слишком
+    // много для функции, которая вызывается на каждый ответ.
+    static char text[web::kMaxListText];
+    const size_t len = web::format_list(*_web_sources, text, sizeof(text));
+
+    // Диагностика дублирования (Р-039): печатаем факт вызова и длину блока.
+    // Если блок в ответе один, а строк две — виновата модель, а не мы.
+    Serial.printf("Источники в ответ: блок %u байт, до него ответ %u байт\n", static_cast<unsigned>(len),
+        static_cast<unsigned>(_store->count() > 0 ? _store->last()->content_len : 0));
+
+    if (len > 0 && append_answer(text, len) && _scroll == 0) _redraw_feed = true;
 }
 
 // --- Агентский цикл ---------------------------------------------------------
@@ -1055,6 +1269,14 @@ bool ChatScreen::step_agent()
         return false;
     }
 
+    // Обработчик попросил поиск: подзапрос уже ушёл, ждём его. Индекс не
+    // двигаем — вызов повторится с готовым результатом в finish_search().
+    if (_search_pending) {
+        _agent_pending = false;
+        enter_mode(Mode::Searching);
+        return false;
+    }
+
     // answer_call() мог не суметь записать результат (арена, файл) и уже
     // закрыть ход. Тогда цикл останавливаем: следующий запрос ушёл бы без
     // ответа на вызов, и модель запуталась бы.
@@ -1086,6 +1308,10 @@ void ChatScreen::execute_call(const tools::Call& call)
     _tool_ctx.hits = _doc_hits;
     _tool_ctx.hits_cap = 16;
     _tool_ctx.confirmed = false;
+    // Источник для source_url: первый найденный в интернете за этот ход, а не
+    // выдуманный моделью адрес (Р-036). Модель всё равно вправе передать свой —
+    // её аргумент важнее: она видела конкретную страницу.
+    _tool_ctx.web_source_url = (_web_sources != nullptr) ? web::primary_url(*_web_sources) : nullptr;
 
     char ts[32];
     now_iso(ts, sizeof(ts));
@@ -1099,6 +1325,12 @@ void ChatScreen::execute_call(const tools::Call& call)
     // Пустые аргументы сервер присылает как "" — инструменту нужен хотя бы
     // пустой объект, иначе валидация решит, что аргументов нет вовсе.
     const char* args = call.arguments_len > 0 ? call.arguments : "{}";
+
+    // Имя каждого вызова — в Serial: без этого «документ записался трижды»
+    // не отличить от «модель попросила трижды». При приёмке командой `ask`
+    // лента не перед глазами, и это единственный способ увидеть ход агента.
+    Serial.printf("Инструмент %u: %s\n", (unsigned)(_agent_step), call.name);
+
     _tools.invoke(call.name, args, strlen(args), _tool_ctx);
 
     // Обработчик попросил подтверждения — ответ пока не отправляем, его даст
@@ -1109,13 +1341,151 @@ void ChatScreen::execute_call(const tools::Call& call)
         return;
     }
 
+    // Обработчик попросил поиск (Р-040) — ответ пока не отправляем: сначала
+    // отдельный запрос с плагином. Индекс не двигаем: вызов повторится с
+    // готовым результатом, когда поиск закончится. Так же устроено удаление.
+    if (_tool_ctx.needs_search) {
+        // Настройка «Веб-поиск» убирает инструмент из списка схем, но модель
+        // может вызвать его по памяти из истории треда. Платить за поиск,
+        // который пользователь выключил, нельзя — отвечаем отказом.
+        if (!_settings->config().search_enabled) {
+            _search_pending = false;
+            answer_call(call,
+                "Ошибка: веб-поиск выключен в настройках устройства. Отвечай по памяти и скажи, что "
+                "данные не проверены.");
+            return;
+        }
+
+        snprintf(_search_query, sizeof(_search_query), "%s", _tool_ctx.search_query);
+        _search_max_results = _tool_ctx.search_max_results;
+        _search_pending = true;
+
+        if (!begin_search(_search_query, _search_max_results)) {
+            // Начать не удалось — модели надо ответить отказом, иначе она будет
+            // ждать результата, которого не будет.
+            _search_pending = false;
+            char msg[200];
+            snprintf(msg, sizeof(msg),
+                "Ошибка: поиск не удалось выполнить (%s). Отвечай по памяти и скажи, что "
+                "данные не проверены.",
+                _search_reason[0] != '\0' ? _search_reason : "нет связи");
+            answer_call(call, msg);
+        }
+        return;
+    }
+
     answer_call(call, _tool_out);
+}
+
+/// Итог хода в Serial: чем именно закончился ответ и что легло в тред.
+///
+/// Нужно при прогоне командой `ask`, когда лента не перед глазами: по одним
+/// счётчикам источников не видно, дошло ли дело до вызова инструмента и не
+/// ушёл ли ответ в повтор. Раньше здесь печаталось только «Ответ: ок» —
+/// и «вызова не было» от «вызов был» этим не отличалось никак.
+void ChatScreen::log_turn_result()
+{
+    const unsigned src_count = _web_sources != nullptr ? static_cast<unsigned>(_web_sources->count) : 0u;
+
+    // Счётчик «поиск: был/не было» — по нему проверяется экономия (Р-040):
+    // основной запрос плагина не несёт ни в одном шаге, и «привет» стоит
+    // ~0,02 ₽ вместо ~2,17 ₽. «Был» здесь означает, что модель позвала
+    // `web_search`, и подзапрос с плагином действительно ушёл.
+    Serial.printf("Ответ: %s, источников %u, поиск %s, шагов агента %d\n", _turn_ok ? "ок" : "оборван", src_count,
+        _web_search_failed ? "не удался" : (_web_search_ran ? "был" : "не было"), static_cast<int>(_agent_step));
+
+    // Хвост треда как есть: роли и начало текста. По нему видно, что модель
+    // сказала после вызова инструмента, а что — до.
+    const size_t total = _store->count();
+    const size_t from = total > 6 ? total - 6 : 0;
+    for (size_t i = from; i < total; ++i) {
+        const hw::ChatMessage& m = _store->at(i);
+        const char* role = m.role == api::Role::User ? "user" : m.role == api::Role::Tool ? "tool" : "assistant";
+        Serial.printf(
+            "  [%s%s] %.*s\n", role, m.name[0] != '\0' ? m.name : "", 70, m.content != nullptr ? m.content : "");
+    }
+}
+
+/// Распечатать открытый тред в Serial: роль, имя инструмента и начало текста.
+///
+/// Нужно, чтобы проверить «дошли ли источники до файла» без платного запроса:
+/// тред уже лежит на карте, и его достаточно прочитать.
+void ChatScreen::print_thread()
+{
+    if (_store == nullptr) {
+        Serial.println("Тред: хранилище не готово");
+        return;
+    }
+    Serial.printf("Тред: %s, сообщений %u\n", _store->slug(), static_cast<unsigned>(_store->count()));
+
+    const size_t total = _store->count();
+    for (size_t i = 0; i < total; ++i) {
+        const hw::ChatMessage& m = _store->at(i);
+        const char* role = m.role == api::Role::User ? "user" : m.role == api::Role::Tool ? "tool" : "assistant";
+        Serial.printf(
+            "[%s%s] %.*s\n", role, m.name[0] != '\0' ? m.name : "", 1600, m.content != nullptr ? m.content : "");
+
+        // Хвост длинного сообщения печатаем отдельно: блок «Источники:»
+        // дописывается в КОНЕЦ ответа, а он бывает в несколько килобайт —
+        // без хвоста «источники не дошли» не отличить от «не влезли в печать».
+        //
+        // Считаем вхождения маркера: их число отвечает на вопрос «дублируется
+        // ли список» без догадок. Хвост мог сам содержать «Источники:», и по
+        // глазам это не отличить от второго блока (так и вышло 26.11.2026).
+        if (m.content != nullptr) {
+            const size_t len = strlen(m.content);
+            if (len > 1600) {
+                const size_t tail = 400 < len ? len - 400 : 0;
+                Serial.printf("  …хвост: %s\n", m.content + tail);
+            }
+            unsigned marks = 0;
+            for (const char* p = m.content; (p = strstr(p, "Источники:")) != nullptr; ++p)
+                ++marks;
+            if (marks > 1) {
+                Serial.printf("  ВНИМАНИЕ: блоков «Источники:» в сообщении %u\n", marks);
+            }
+        }
+    }
 }
 
 /// Инструменты, после которых содержимое архива меняется и индекс устаревает.
 bool changes_archive(const char* name)
 {
     return name != nullptr && (strcmp(name, "write_doc") == 0 || strcmp(name, "delete_doc") == 0);
+}
+
+/// Что легло во фронтматтер последней записи — в Serial.
+///
+/// Приёмка v0.4.0 проверяет, что `source_url` заметки взят из найденного
+/// источника, а не выдуман моделью. При прогоне командой `ask` экран заметок
+/// не перед глазами, поэтому печатаем то, что реально записано в файл:
+/// результат инструмента («Создан документ home/x.md») и поле из фронтматтера,
+/// перечитанное с карты. Путь берём из результата — отдельного канала от
+/// инструмента нет, и добавлять его значило бы менять контракт ради лога.
+void ChatScreen::log_written_doc()
+{
+    constexpr const char* kMarker = "документ ";
+    const char* at = strstr(_tool_out, kMarker);
+    if (at == nullptr) {
+        Serial.printf("Заметка: %s\n", _tool_out);
+        return;
+    }
+    at += strlen(kMarker);
+
+    char rel[paths::kMaxPathLen];
+    size_t n = 0;
+    while (at[n] != '\0' && at[n] != '\n' && n + 1 < sizeof(rel))
+        ++n;
+    memcpy(rel, at, n);
+    rel[n] = '\0';
+
+    static doc::Meta meta;  // 4 КБ на стеке задачи интерфейса не место
+    size_t bytes = 0;
+    if (_docs->read_meta(rel, meta, &bytes)) {
+        Serial.printf("Заметка: %s, source_url=%s\n", rel, meta.source_url[0] != '\0' ? meta.source_url : "(пусто)");
+    } else {
+        Serial.printf("Заметка: %s записана, фронтматтер не перечитался\n", rel);
+    }
 }
 
 void ChatScreen::answer_call(const tools::Call& call, const char* text)
@@ -1146,6 +1516,12 @@ void ChatScreen::answer_call(const tools::Call& call, const char* text)
             // Не ошибка диалога: документ записан, пострадал только индекс.
             Serial.printf("Архив: индекс не пересобрался — %s\n", idx_err);
         }
+
+        // Что легло во фронтматтер — в Serial. Проверяемое при приёмке поле —
+        // source_url, подставленный из первого источника поиска (Р-036), но
+        // при прогоне командой `ask` экран заметок не перед глазами, и
+        // заметка читается уже после прогона.
+        if (strcmp(call.name, "write_doc") == 0) log_written_doc();
     }
 
     _redraw_feed = true;
@@ -1237,6 +1613,213 @@ void ChatScreen::resolve_delete(bool confirmed)
     _agent_pending = true;
 }
 
+// --- Веб-поиск (Р-040) ------------------------------------------------------
+//
+// Поиск — инструмент, но обработчик инструмента не может ходить в сеть: он
+// синхронный, а запрос занимает 20–30 с, и вызывается из tick(). Поэтому
+// обработчик только складывает запрос в контекст и взводит флаг, а здесь
+// делается ОТДЕЛЬНЫЙ запрос с плагином `web` — без `tools`, чтобы не было
+// рекурсии. Результат возвращается модели как обычный ответ инструмента, и
+// агентский цикл продолжается.
+//
+// Почему отдельный запрос, а не плагин в основном: плагин заставляет сервер
+// искать по тексту ЛЮБОЙ реплики, включая «привет», и стоит ~2,1 ₽ за запрос.
+// Модель же решает, нужен ли интернет, бесплатно — это её собственный ход.
+
+bool ChatScreen::begin_search(const char* query, uint8_t max_results)
+{
+    _search_reason[0] = '\0';
+    _search_ended = false;
+    _search_ok = true;
+    _search_text_len = 0;
+    _search_input_tokens = 0;
+    _search_output_tokens = 0;
+    if (_search_text != nullptr) _search_text[0] = '\0';
+
+    if (_search_body == nullptr || _search_text == nullptr) {
+        snprintf(_search_reason, sizeof(_search_reason), "не хватило памяти");
+        _web_search_failed = true;
+        return false;
+    }
+
+    if (g_search_sink == nullptr) g_search_sink = new SearchSink(this);
+
+    // Отметка в общем списке источников: в результат этого поиска пойдут
+    // только ссылки, пришедшие после неё (см. _search_src_from).
+    _search_src_from = (_web_sources != nullptr) ? _web_sources->count : 0;
+
+    const settings::Config& cfg = _settings->config();
+    // Модель число не назвала (0) — берём настройку «Источников в ответе»:
+    // иначе этот пункт в Ctrl+A молча ни на что не влиял бы.
+    if (max_results == 0) max_results = cfg.search_max_results;
+
+    const size_t body_len = wsearch::build_body(query, cfg.api_model, max_results, _search_body, kSearchBodyCap);
+    if (body_len == 0) {
+        snprintf(_search_reason, sizeof(_search_reason), "запрос не собрался");
+        _web_search_failed = true;
+        return false;
+    }
+
+    // Строка статуса: видно, что именно ищется. Запрос модели не показываем
+    // целиком — он бывает длинным; в статусе хватает начала. Если запрос не
+    // влез, snprintf его обрежет, и обрезка может прийтись на середину
+    // кириллического символа — тогда отступаем к началу символа.
+    snprintf(_search_status, sizeof(_search_status), "ищу в сети: %s", query);
+    {
+        size_t end = strlen(_search_status);
+        const size_t cap = sizeof(_search_status) - 1;
+        if (end >= cap) {
+            // Последний оставшийся байт — продолжение символа (10xxxxxx):
+            // значит символ разрезан, отступаем к его началу.
+            while (end > 0 && (static_cast<unsigned char>(_search_status[end - 1]) & 0xC0) == 0x80)
+                --end;
+            _search_status[end] = '\0';
+        }
+    }
+
+    char err[128];
+    if (!_api->start(cfg.api_base_url, _settings->secrets().api_key, _search_body, g_search_sink, err, sizeof(err))) {
+        snprintf(_search_reason, sizeof(_search_reason), "%s", err[0] != '\0' ? err : "запрос не отправился");
+        _web_search_failed = true;
+        return false;
+    }
+
+    Serial.printf("Поиск: запрос «%.120s», источников просим %u\n", query, static_cast<unsigned>(max_results));
+
+    // Поиск действительно пошёл. Ставим здесь, а не по приходу источников:
+    // пустая выдача — тоже поиск, и в ленте должно появиться «поиск не дал
+    // результатов», а не молчание. Ошибку поиска это тоже помечает, но она
+    // видна отдельно — текстом в статусе ошибки и отказом модели.
+    _web_search_ran = true;
+    _web_search_failed = false;
+    _wait_started = millis();
+    _wait_sec = -1;
+    _dots = -1;
+    return true;
+}
+
+void ChatScreen::on_search_text(const char* text, size_t len)
+{
+    if (text == nullptr || len == 0 || _search_text == nullptr) return;
+
+    const size_t room = kSearchTextCap - 1 - _search_text_len;
+    const size_t take = len < room ? len : room;
+    if (take > 0) {
+        memcpy(_search_text + _search_text_len, text, take);
+        _search_text_len += take;
+        _search_text[_search_text_len] = '\0';
+    }
+}
+
+void ChatScreen::on_search_usage(long input_tokens, long output_tokens)
+{
+    // Поисковый подзапрос тоже платный, и его токены входят в счёт за сессию.
+    // Прибавляем дельту: сервер вправе прислать usage несколько раз, и
+    // накопительный итог посчитался бы дважды.
+    _session_input += input_tokens - _search_input_tokens;
+    _session_output += output_tokens - _search_output_tokens;
+    _search_input_tokens = input_tokens;
+    _search_output_tokens = output_tokens;
+    _redraw_status = true;
+}
+
+void ChatScreen::on_search_retry(int attempt, int delay_s)
+{
+    _retry_attempt = attempt;
+    _retry_delay_s = delay_s;
+    _retry_started_ms = millis();
+    _redraw_status = true;
+}
+
+void ChatScreen::on_search_finished(const char* reason)
+{
+    snprintf(_search_reason, sizeof(_search_reason), "%s", reason != nullptr ? reason : "stop");
+    _search_ok = true;
+    _search_ended = true;
+}
+
+void ChatScreen::on_search_error(const char* message)
+{
+    snprintf(_search_reason, sizeof(_search_reason), "%s", message != nullptr ? message : "ошибка сети");
+    _search_ok = false;
+    _search_ended = true;
+    _web_search_failed = true;
+}
+
+void ChatScreen::finish_search()
+{
+    _search_ended = false;
+    _search_pending = false;
+
+    if (_agent_calls == nullptr) {
+        enter_mode(Mode::Idle);
+        return;
+    }
+
+    const size_t idx = _agent_call_index;
+    if (idx >= _agent_calls->count()) {
+        // Вызов уже отработал, а поиск завершился позже — этого быть не должно,
+        // но зависший агент хуже лишней проверки.
+        enter_mode(Mode::Sending);
+        _agent_pending = true;
+        return;
+    }
+
+    const tools::Call& call = _agent_calls->at(idx);
+
+    // Результат — 2 КБ. На стеке задачи интерфейса его держать нельзя: рядом
+    // живут TLS и парсер, и 8 КБ стека не хватает (проверено: «Stack
+    // protection fault» сразу после прихода источников). Буфер один на экран,
+    // он же место, где формируется результат инструмента.
+    char* result = _tool_out;
+
+    // Текст поискового ответа — только материал результата: в ленту он не
+    // попадает, там будет ответ основной модели. Источники — лишь пришедшие
+    // этим поиском (list_from): список на экране один на ход, и без отсечения
+    // второй поиск отчитался бы ссылками первого.
+    //
+    // Пустой список — не отдельный объект: web::List это ~6 КБ, и локальная
+    // копия на стеке уже роняла плату. Берём указатель, а отсутствие
+    // источников видно по count.
+    const web::List* sources = _web_sources;
+
+    if (!_search_ok) {
+        // 400 байт на стеке — это нормально, а вот объект списка источников
+        // (6 КБ) нет; поэтому причина собирается в маленький буфер.
+        char msg[400];
+        snprintf(msg, sizeof(msg), "Ошибка: поиск не удался (%s). Отвечай по памяти и скажи, что данные не проверены.",
+            _search_reason);
+        answer_call(call, msg);
+    } else if (result == nullptr) {
+        answer_call(call,
+            "Ошибка: не хватило памяти под результат поиска. Отвечай по памяти и скажи, что данные "
+            "не проверены.");
+    } else {
+        const size_t n = wsearch::format_result(
+            _search_text, _search_text_len, sources, result, tools::kMaxResultBytes + 1, _search_src_from);
+
+        // Размер списка мог уменьшиться только через `clear()` — тогда отметка
+        // больше его, и вычитание в size_t дало бы астрономическое число в
+        // логе. Считаем «новых» с зажимом, как это делает format_result.
+        const size_t total = sources != nullptr ? sources->count : 0u;
+        const size_t fresh = total > _search_src_from ? total - _search_src_from : 0u;
+        Serial.printf("Поиск: ответ %u байт, пересказ %u байт, источников новых %u из %u\n",
+            static_cast<unsigned>(_search_text_len), static_cast<unsigned>(n), static_cast<unsigned>(fresh),
+            static_cast<unsigned>(total));
+        answer_call(call, n > 0 ? result : "Поиск ничего не нашёл.");
+    }
+
+    if (_mode == Mode::Idle) {
+        _agent_pending = false;
+        return;
+    }
+
+    // Вызов отработал — переходим к следующему.
+    ++_agent_call_index;
+    enter_mode(Mode::Sending);
+    _agent_pending = true;
+}
+
 // --- Периодика --------------------------------------------------------------
 
 void ChatScreen::tick()
@@ -1292,6 +1875,20 @@ void ChatScreen::tick()
     // все сразу заморозили бы экран на секунды. Остальные — в следующих кадрах.
     if (_agent_pending) {
         step_agent();
+        if (_mode == Mode::Idle) return;
+    }
+
+    // Поиск завершился: отдаём модели результат и продолжаем цикл агента.
+    // Делаем это в tick(), а не в on_search_finished(): start() нового запроса
+    // внутри обработчика потока переинициализировал бы парсер под feed().
+    //
+    // Режим проверяем обязательно. cancel() (Esc, переполнение буфера) тоже
+    // зовёт on_search_error, и тот взводит _search_ended — но ход уже брошен,
+    // и finish_search() дописал бы в тред результат инструмента, на чей вызов
+    // ответа в треде больше нет. Модель получила бы role=tool на вызов,
+    // которого не видит.
+    if (_search_ended && _mode == Mode::Searching) {
+        finish_search();
         if (_mode == Mode::Idle) return;
     }
 
@@ -1396,6 +1993,19 @@ void ChatScreen::on_tool_calls(const tools::Accumulator& calls)
     if (_agent_calls == nullptr) return;
     *_agent_calls = calls;
     _have_calls = _agent_calls->any();
+}
+
+void ChatScreen::on_web_sources(const web::List& sources)
+{
+    if (_web_sources == nullptr) return;
+    web::append(*_web_sources, sources);
+    _web_search_ran = true;
+
+    // Пишем в Serial: при прогоне по команде `ask` экран может быть не на
+    // виду, а «источники пришли» — главное, что нужно подтвердить. Печатаем
+    // счётчики, а не сам список: он бывает на 10 КБ.
+    Serial.printf("Поиск: получено %u, всего %u\n", static_cast<unsigned>(sources.count),
+        static_cast<unsigned>(_web_sources->count));
 }
 
 void ChatScreen::on_answer_retry(int attempt, int delay_s)
@@ -1518,7 +2128,7 @@ void ChatScreen::measure_messages()
             continue;
         }
 
-        size_t lines = kLabelLines + count_lines(shown_text(m, g_line_buf, sizeof(g_line_buf)), width);
+        size_t lines = kLabelLines + count_lines(shown_text(m), width);
         if (lines > kMaxLinesPerMessage) lines = kMaxLinesPerMessage;
         _line_counts[i] = static_cast<uint16_t>(lines);
     }
@@ -1788,8 +2398,7 @@ void ChatScreen::paint_feed(const chatview::Window& win, int band_top, int band_
         const uint16_t color = role_color(m.role, m.partial);
 
         // У результатов инструмента в ленте только одна строка — см. shown_text().
-        char shown_buf[sizeof(g_line_buf)];
-        const char* body = shown_text(m, shown_buf, sizeof(shown_buf));
+        const char* body = shown_text(m);
         const size_t lines = split_lines(body, width, g_offsets, kMaxLinesPerMessage);
 
         // Подпись роли — строка 0 сообщения, текст начинается со строки 1.
@@ -1881,6 +2490,8 @@ void ChatScreen::draw_input_field()
             ui::text("Вопрос…", text_x, text_y, kColorFaint);
         } else if (_mode == Mode::Confirming) {
             ui::text("Подтвердите удаление: Enter или Esc", text_x, text_y, kColorPartial);
+        } else if (_mode == Mode::Searching) {
+            ui::text("Ищу в интернете · Esc — прервать", text_x, text_y, kColorPartial);
         } else {
             ui::text("Ждите ответа · Esc — прервать", text_x, text_y, kColorFaint);
         }
@@ -1926,7 +2537,26 @@ void ChatScreen::draw_status()
 
     char left[128];
     switch (_mode) {
-    case Mode::Idle: left[0] = '\0'; break;
+    case Mode::Idle:
+        // Итог поиска в статусе, пока не задан новый вопрос: список ссылок
+        // стоит в конце ответа, и в длинной реплике его надо ещё найти
+        // прокруткой. Строка отвечает на вопрос «искали ли вообще и сколько
+        // нашли» одним взглядом.
+        //
+        // Порядок проверок важен: в ходе могло быть два поиска, и удачный
+        // первый не должен выглядеть неудачей из-за второго. Источники есть —
+        // значит поиск нашёл; «не удался» — только когда их нет вовсе.
+        if (_web_sources != nullptr && _web_sources->count > 0) {
+            const unsigned n = static_cast<unsigned>(_web_sources->count);
+            snprintf(left, sizeof(left), "поиск: %u %s", n, n == 1 ? "источник" : (n < 5 ? "источника" : "источников"));
+        } else if (_web_search_failed) {
+            snprintf(left, sizeof(left), "поиск не удался");
+        } else if (_web_search_ran) {
+            snprintf(left, sizeof(left), "поиск без результата");
+        } else {
+            left[0] = '\0';
+        }
+        break;
     case Mode::Sending: {
         if (_retry_delay_s > 0) {
             // Обратный отсчёт, а не просто «ждём»: видно, что пауза конечна и
@@ -1952,6 +2582,22 @@ void ChatScreen::draw_status()
         break;
     }
     case Mode::Streaming: snprintf(left, sizeof(left), "печатает…  %d с", _wait_sec > 0 ? _wait_sec : 0); break;
+
+    // Поиск идёт отдельным запросом — и это видно. Иначе ход с поиском выглядел
+    // в точности как обычный ответ: владелец справедливо спрашивал, работает
+    // ли поиск вообще.
+    case Mode::Searching:
+        if (_retry_delay_s > 0) {
+            const unsigned long elapsed = (millis() - _retry_started_ms) / 1000;
+            int left_s = _retry_delay_s - static_cast<int>(elapsed);
+            if (left_s < 0) left_s = 0;
+            snprintf(left, sizeof(left), "поиск · повтор %d через %d с", _retry_attempt, left_s);
+        } else {
+            snprintf(left, sizeof(left), "%.80s%s  %d с", _search_status[0] != '\0' ? _search_status : "ищу в сети",
+                (millis() / 400) % 2 == 0 ? "." : "..", _wait_sec > 0 ? _wait_sec : 0);
+        }
+        break;
+
     case Mode::Confirming: snprintf(left, sizeof(left), "ждёт подтверждения"); break;
     }
 
@@ -1972,11 +2618,25 @@ void ChatScreen::draw_status()
 
 void ChatScreen::draw_error()
 {
-    M5.Display.fillRect(0, kErrorY, M5.Display.width(), 30, TFT_BLACK);
+    // Полоса на всю ширину: у ошибки своя подложка, у подсказки — чёрный фон.
+    // Раньше отказ сервера и «введите вопрос» были одной оранжевой строкой.
+    M5.Display.fillRect(0, kErrorY, M5.Display.width(), 30, _failed ? kColorErrorBg : TFT_BLACK);
     if (_error[0] == '\0') return;
 
-    // Ошибку показываем целиком, а не обрывком: в ней обычно адрес или код,
-    // и потерянная половина делает её бесполезной.
+    if (_failed) {
+        // Длинный отказ («Лимит трат по ключу исчерпан: 100,22 из 100,00 руб.
+        // Пополните баланс.») в 1280 px не влезает одной строкой — обрезаем
+        // по ширине с «…». Начало сохраняется: там суть, что случилось.
+        char buf[192];
+        const char* shown = ui::fit_width(_error, M5.Display.width() - 2 * kMarginX, buf, sizeof(buf));
+        // text_plain, а не text: у text() под каждым глифом заливается фон
+        // (по умолчанию чёрный). На тёмно-красной полосе это давало чёрные
+        // прямоугольники вокруг букв — проверено на плате счётом пикселей.
+        ui::text_plain(shown, kMarginX, kErrorY, kColorError);
+        return;
+    }
+
+    // Сообщение-подсказка: не ошибка, краснеть незачем.
     ui::text(_error, kMarginX, kErrorY, kColorPartial);
 }
 

@@ -44,7 +44,7 @@ const Tool* Registry::find(const char* name) const
     return nullptr;
 }
 
-bool Registry::build_tools_json(char* out, size_t out_len) const
+bool Registry::build_tools_json(char* out, size_t out_len, const char* skip_name) const
 {
     if (out == nullptr || out_len == 0) return false;
 
@@ -62,8 +62,15 @@ bool Registry::build_tools_json(char* out, size_t out_len) const
     // модель с пустым tools иногда печатает DSML (Р-025). Пусть вызывающий
     // решает, передавать ли поле вовсе.
     if (!put("[")) return false;
+    bool first = true;
     for (size_t i = 0; i < _count; ++i) {
-        if (i > 0 && !put(", ")) return false;
+        // Пропущенный инструмент нужен, чтобы настройка «веб-поиск выключен»
+        // не прятала от модели архив: раньше плагин отключался полем в
+        // запросе, а инструмент так не отключить — только убрать из списка.
+        if (skip_name != nullptr && strcmp(_tools[i].name, skip_name) == 0) continue;
+
+        if (!first && !put(", ")) return false;
+        first = false;
         if (!put("{\"type\": \"function\", \"function\": ")) return false;
         if (!put(_tools[i].schema)) return false;
         if (!put("}")) return false;
@@ -78,6 +85,8 @@ bool Registry::invoke(const char* name, const char* args_json, size_t args_len, 
     ctx.deferred = false;
     ctx.needs_confirm = false;
     ctx.confirm_path[0] = '\0';
+    ctx.needs_search = false;
+    ctx.search_query[0] = '\0';
 
     const Tool* t = find(name);
     if (t == nullptr) {

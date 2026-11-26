@@ -53,6 +53,8 @@ private:
         Model,
         Temperature,
         Reasoning,
+        Search,
+        SearchResults,
         Count,
     };
 
@@ -67,6 +69,9 @@ private:
     const char* field_name(Field f) const;
     /// Значение поля как строка для отображения.
     void field_value(Field f, char* out, size_t out_len) const;
+
+    /// Поле меняется стрелками, а не вводом текста (числа, перечисления).
+    static bool stepper(Field f);
 
     /// Буфер поля, доступный для ввода, и его ёмкость. nullptr — поле не
     /// строковое (температура и уровень меняются стрелками).

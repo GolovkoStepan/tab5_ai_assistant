@@ -70,6 +70,27 @@ public:
     /// Отключиться и вернуться в Idle.
     void disconnect();
 
+    // --- Радио целиком (диагностика) ---
+
+    /// Выключить радио: `WiFi.mode(WIFI_OFF)` останавливает стек, и
+    /// автопереподключение уже не поднимет связь само.
+    ///
+    /// Зачем это нужно, если есть disconnect(): тот лишь рвёт текущее
+    /// соединение, а `setAutoReconnect(true)` тут же начинает новое. Для
+    /// проверки «что будет без интернета» нужен именно выключенный драйвер.
+    /// @return false, если радио не поднималось вовсе
+    bool power_off();
+
+    /// Включить радио обратно. Подключение к сохранённой сети запускает
+    /// вызывающий (`auto_connect`) — у драйвера нет учётных данных.
+    /// @param[out] elapsed_ms сколько занял подъём драйвера (может быть nullptr)
+    /// @return false, если драйвер не поднялся
+    bool power_on(uint32_t* elapsed_ms = nullptr);
+
+    /// Радио включено. Отличается от connected(): связь может быть, а радио
+    /// выключено командой — тогда «нет сети» это ожидаемое состояние.
+    bool radio_on() const { return _radio_on; }
+
     State state() const { return _state; }
     bool connected() const { return _state == State::Connected; }
     bool connecting() const { return _state == State::Connecting; }
@@ -114,6 +135,8 @@ private:
     char _ip[16]{"—"};
     char _mac[18]{};
     bool _begun{false};
+    /// Радио включено. Сбрасывается power_off() и поднимается power_on().
+    bool _radio_on{false};
 };
 
 }  // namespace hw

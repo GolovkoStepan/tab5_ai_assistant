@@ -36,6 +36,7 @@
 #include "ui/tray.h"
 #include "ui/wifi_screen.h"
 #include "util/format.h"
+#include "util/serial_cmd.h"
 #include "util/tray_state.h"
 #include "version.h"
 
@@ -946,9 +947,121 @@ void setup()
     g_help_screen.draw();
 }
 
+/// Строка из Serial: вопрос в чат или подсказка.
+///
+/// Читаем неблокирующе: за проход забираем только то, что уже пришло, и
+/// копим до перевода строки. Иначе ожидание конца строки замирало бы весь
+/// интерфейс, как было бы с Serial.readStringUntil().
+///
+/// Буфер небольшой намеренно: вопрос длиннее — это не команда, а вставленный
+/// случайно лог, и молча отправлять его в модель (за деньги) нельзя.
+void poll_serial_command()
+{
+    static char line[1024];
+    static size_t len = 0;
+    static bool overflow = false;
+
+    while (Serial.available() > 0) {
+        const int ch = Serial.read();
+        if (ch < 0) break;
+
+        if (ch == '\n' || ch == '\r') {
+            if (overflow) {
+                Serial.println("Serial: строка слишком длинная — пропущена");
+            } else if (len > 0) {
+                const char* text = nullptr;
+                size_t text_len = 0;
+                switch (serialcmd::parse(line, len, &text, &text_len)) {
+                case serialcmd::Kind::Ask:
+                    // Вопрос уходит в текущий тред: команда не должна молча
+                    // создавать новый — иначе история разговора выглядела бы
+                    // потерянной.
+                    if (!g_chat_screen.ask(text, text_len)) {
+                        Serial.printf("Serial: вопрос не отправлен — %s\n", g_chat_screen.last_error());
+                    }
+                    break;
+                case serialcmd::Kind::Help: Serial.println(serialcmd::help_text()); break;
+                case serialcmd::Kind::Thread: g_chat_screen.print_thread(); break;
+                case serialcmd::Kind::WifiOff:
+                    // Выключение посреди хода оборвёт запрос — но именно это
+                    // и проверяется приёмкой «что будет без интернета». Не
+                    // запрещаем, а предупреждаем: команда диагностическая и
+                    // набирается намеренно.
+                    if (g_chat_screen.busy()) {
+                        Serial.println("Serial: идёт ход — он оборвётся, модель ответит, что данные не проверены");
+                    }
+                    if (g_wifi.power_off()) {
+                        Serial.println("Serial: Wi-Fi выключен (wifi on — вернуть)");
+                    } else {
+                        Serial.println("Serial: радио не поднималось, выключать нечего");
+                    }
+                    break;
+                case serialcmd::Kind::WifiOn: {
+                    if (g_wifi.radio_on() && g_wifi.connected()) {
+                        Serial.println("Serial: Wi-Fi уже подключён");
+                        break;
+                    }
+                    uint32_t elapsed = 0;
+                    if (!g_wifi.power_on(&elapsed)) {
+                        Serial.println("Serial: радио не включилось");
+                        break;
+                    }
+                    Serial.printf("Serial: радио включено за %lu мс\n", static_cast<unsigned long>(elapsed));
+                    // Драйвер поднят, но учётных данных у него нет — подключение
+                    // по сохранённой сети запускаем сами.
+                    g_wifi.auto_connect(g_settings.secrets());
+                    Serial.println("Serial: Wi-Fi включён, подключаюсь по сохранённой сети");
+                    break;
+                }
+                case serialcmd::Kind::Api: {
+                    // Подмена адреса API — только для проверки на своём
+                    // сервере. Полный адрес не печатаем: в нём может быть
+                    // чужой хост, а лог Serial читается и без ключа.
+                    if (g_chat_screen.busy()) {
+                        Serial.println("Serial: идёт ход — адрес не меняю, дождитесь ответа или нажмите Esc");
+                        break;
+                    }
+                    settings::Config next = g_settings.config();
+                    if (text_len >= sizeof(next.api_base_url)) {
+                        Serial.println("Serial: адрес длиннее 191 символа — не помещается");
+                        break;
+                    }
+                    memcpy(next.api_base_url, text, text_len);
+                    next.api_base_url[text_len] = '\0';
+
+                    char err[128];
+                    if (!g_settings.set_api_settings(next, err, sizeof(err))) {
+                        Serial.printf("Serial: адрес не принят — %s\n", err);
+                        break;
+                    }
+                    // Схемы инструментов и тело запроса читают конфиг при
+                    // отправке, так что пересборка не нужна: следующий вопрос
+                    // уже пойдёт на новый адрес.
+                    Serial.println("Serial: адрес API изменён и сохранён в config.json");
+                    break;
+                }
+                case serialcmd::Kind::Unknown: Serial.println(serialcmd::help_text()); break;
+                case serialcmd::Kind::None: break;
+                }
+            }
+            len = 0;
+            overflow = false;
+            continue;
+        }
+
+        if (len + 1 >= sizeof(line)) {
+            overflow = true;
+            continue;
+        }
+        line[len++] = static_cast<char>(ch);
+    }
+}
+
 void loop()
 {
     M5.update();
+
+    poll_serial_command();
 
     // --- Клавиатура ---------------------------------------------------------
     hw::KeyEvent ev;

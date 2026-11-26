@@ -26,7 +26,9 @@ constexpr int kRowsY = 62;
 constexpr int kRowH = 64;
 constexpr int kLabelY = 6;
 constexpr int kValueY = 30;
-constexpr int kErrorY = 400;
+/// Полоса ошибки ниже последней строки формы: полей стало семь (с веб-поиском),
+/// и прежние 400 px накрыли бы строку «Источников».
+constexpr int kErrorY = 540;
 constexpr int kHintsY = 662;
 
 constexpr uint16_t kColorSelected = 0x0320;  // тёмно-зелёный
@@ -67,6 +69,15 @@ const char* effort_name(uint8_t level)
     case 3: return "high — высокий";
     default: return "?";
     }
+}
+
+/// Подпись поля с числом результатов. Показываем и «сколько страниц в ответе»,
+/// и «сколько это стоит», потому что поиск тарифицируется за запрос.
+const char* results_note(uint8_t n)
+{
+    if (n <= 1) return "одна страница";
+    if (n <= 4) return "несколько страниц";
+    return "широкая выдача";
 }
 
 }  // namespace
@@ -176,7 +187,7 @@ bool ApiSettingsScreen::onKey(const hw::KeyEvent& ev)
 
     case keymap::Special::Enter:
     case keymap::Special::Space:
-        if (_selected == Field::Temperature || _selected == Field::Reasoning) {
+        if (stepper(_selected)) {
             adjust_value(1);
         } else {
             begin_edit();
@@ -184,11 +195,11 @@ bool ApiSettingsScreen::onKey(const hw::KeyEvent& ev)
         return false;
 
     case keymap::Special::Left:
-        if (_selected == Field::Temperature || _selected == Field::Reasoning) adjust_value(-1);
+        if (stepper(_selected)) adjust_value(-1);
         return false;
 
     case keymap::Special::Right:
-        if (_selected == Field::Temperature || _selected == Field::Reasoning) adjust_value(1);
+        if (stepper(_selected)) adjust_value(1);
         return false;
 
     default: return false;
@@ -377,6 +388,11 @@ void ApiSettingsScreen::confirm_edit()
     _redraw_hints = true;
 }
 
+bool ApiSettingsScreen::stepper(Field f)
+{
+    return f == Field::Temperature || f == Field::Reasoning || f == Field::Search || f == Field::SearchResults;
+}
+
 void ApiSettingsScreen::adjust_value(int delta)
 {
     if (_selected == Field::Temperature) {
@@ -385,6 +401,14 @@ void ApiSettingsScreen::adjust_value(int delta)
     } else if (_selected == Field::Reasoning) {
         const int r = static_cast<int>(_draft.reasoning_effort) + delta;
         if (r >= 0 && r <= 3) _draft.reasoning_effort = static_cast<uint8_t>(r);
+    } else if (_selected == Field::Search) {
+        // Флажок: ← выключает, → и Enter включают. Переключение «всегда» на
+        // любое нажатие сбивало бы с толку — не видно, в какую сторону шаг.
+        _draft.search_enabled = (delta > 0);
+    } else if (_selected == Field::SearchResults) {
+        // 1..10 — то же, что разрешает settings::validate и web::kMaxSources.
+        const int n = static_cast<int>(_draft.search_max_results) + delta;
+        if (n >= 1 && n <= 10) _draft.search_max_results = static_cast<uint8_t>(n);
     }
     _notice_ok = false;
     _redraw_rows = true;
@@ -399,8 +423,8 @@ bool ApiSettingsScreen::onTouch(int x, int y)
     const int row = (y - kRowsY) / kRowH;
     const Field f = static_cast<Field>(row);
 
-    if (f == _selected && (f == Field::Temperature || f == Field::Reasoning)) {
-        // Повторное касание по числовому полю — шаг вперёд.
+    if (f == _selected && stepper(f)) {
+        // Повторное касание по полю-шагу — шаг вперёд.
         adjust_value(1);
         return true;
     }
@@ -411,7 +435,7 @@ bool ApiSettingsScreen::onTouch(int x, int y)
     _redraw_rows = true;
     _redraw_error = true;
 
-    if (f == Field::Temperature || f == Field::Reasoning) return true;
+    if (stepper(f)) return true;
 
     begin_edit();
     (void)x;
@@ -492,6 +516,8 @@ const char* ApiSettingsScreen::field_name(Field f) const
     case Field::Model: return "Модель";
     case Field::Temperature: return "Температура";
     case Field::Reasoning: return "Рассуждения";
+    case Field::Search: return "Веб-поиск";
+    case Field::SearchResults: return "Источников в ответе";
     default: return "";
     }
 }
@@ -524,6 +550,21 @@ void ApiSettingsScreen::field_value(Field f, char* out, size_t out_len) const
     case Field::Model: snprintf(out, out_len, "%s", _draft.api_model); return;
     case Field::Temperature: snprintf(out, out_len, "%.1f", _draft.temperature_tenths / 10.0); return;
     case Field::Reasoning: snprintf(out, out_len, "%s", effort_name(_draft.reasoning_effort)); return;
+    case Field::Search: snprintf(out, out_len, "%s", _draft.search_enabled ? "включён" : "выключен"); return;
+    case Field::SearchResults:
+        // При выключенном поиске число ни на что не влияет — говорим об этом
+        // прямо, иначе настройка выглядит рабочей и её правят впустую.
+        if (!_draft.search_enabled) {
+            snprintf(out, out_len, "%u · поиск выключен", static_cast<unsigned>(_draft.search_max_results));
+        } else if (_draft.search_max_results == 0) {
+            // 0 в файле означает «как решит сервер» (умолчание — 5). Стрелка
+            // вправо поднимет до 1: явное число понятнее серверного умолчания.
+            snprintf(out, out_len, "0 — по усмотрению сервера");
+        } else {
+            snprintf(out, out_len, "%u — %s", static_cast<unsigned>(_draft.search_max_results),
+                results_note(_draft.search_max_results));
+        }
+        return;
     default: return;
     }
 }
@@ -651,7 +692,7 @@ void ApiSettingsScreen::draw_field_row(Field f)
     const int idx = static_cast<uint8_t>(f);
     const int y = kRowsY + idx * kRowH;
     const bool sel = (f == _selected);
-    const bool numeric = (f == Field::Temperature || f == Field::Reasoning);
+    const bool numeric = stepper(f);
     const bool editing = sel && _mode == Mode::Editing;
 
     M5.Display.fillRect(0, y, M5.Display.width(), kRowH, sel ? kColorSelected : TFT_BLACK);
@@ -664,7 +705,15 @@ void ApiSettingsScreen::draw_field_row(Field f)
     // наезжать.
     const char* hint = nullptr;
     if (numeric) {
-        hint = (f == Field::Temperature) ? "← → шаг 0.1" : "← → уровень";
+        if (f == Field::Temperature) {
+            hint = "← → шаг 0.1";
+        } else if (f == Field::Reasoning) {
+            hint = "← → уровень";
+        } else if (f == Field::Search) {
+            hint = "← → вкл/выкл";
+        } else {
+            hint = "← → число";
+        }
     } else if (editing) {
         hint = "Enter — принять · Esc — отменить";
     }

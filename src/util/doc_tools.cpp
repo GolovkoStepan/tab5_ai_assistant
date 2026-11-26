@@ -226,6 +226,13 @@ bool write_doc(const char* args, size_t args_len, tools::Context& ctx)
     const bool has_url = tools::arg_string(args, args_len, "source_url", meta.source_url, sizeof(meta.source_url));
     const bool has_tags = tools::arg_string(args, args_len, "tags", meta.tags, sizeof(meta.tags));
 
+    // Модель не передала ссылку, а веб-поиск в этом ходе что-то нашёл —
+    // подставляем первый источник (Р-036). Это лучше, чем пустой source_url:
+    // заметка, в которой не сказано, откуда взяты шаги, бесполезна.
+    if (!has_url && ctx.web_source_url != nullptr && ctx.web_source_url[0] != '\0') {
+        snprintf(meta.source_url, sizeof(meta.source_url), "%s", ctx.web_source_url);
+    }
+
     // Обновление существующего документа: недостающие поля берём из старого
     // файла. Модель, дописывая абзац, обычно присылает только path, title и
     // content — и теги с источником исчезали бы из фронтматтера навсегда.

@@ -163,6 +163,11 @@ size_t build_request(const OutMessage* msgs, size_t count, const RequestOptions&
         ok = put(out, out_len, &used, ",\"tools\":") && put(out, out_len, &used, opt.tools_json);
     }
 
+    // plugins — веб-поиск. Живёт рядом с tools: они совместимы (Р-036).
+    if (ok && opt.plugins_json != nullptr && opt.plugins_json[0] != '\0') {
+        ok = put(out, out_len, &used, ",\"plugins\":") && put(out, out_len, &used, opt.plugins_json);
+    }
+
     ok = ok && put(out, out_len, &used, "}");
 
     out[used] = '\0';
@@ -280,6 +285,51 @@ bool parse_error(const char* json, size_t len, int http_code, char* out, size_t 
     }
 
     JsonVariant error = doc["error"];
+
+    // Лимит трат по ключу: RouterAI отвечает 429 с текстом
+    // «API key weekly spending limit exceeded: 100,22 руб. / 100,00 руб.».
+    // Показывать его как есть бессмысленно — английский, и непонятно, что
+    // делать. Но суммы из него полезны: человеку нужно знать, сколько
+    // потрачено и каков потолок.
+    if (quota_exhausted(http_code, json, len)) {
+        const char* raw = nullptr;
+        if (!error.isNull()) {
+            raw = error.is<const char*>() ? error.as<const char*>() : error["message"].as<const char*>();
+        }
+        if (raw == nullptr) raw = doc["message"].as<const char*>();
+
+        // Достаём числа «потрачено / потолок» из хвоста сообщения.
+        double spent = 0;
+        double limit = 0;
+        bool have_numbers = false;
+        if (raw != nullptr) {
+            const char* colon = strrchr(raw, ':');
+            if (colon != nullptr) {
+                // Числа записаны с запятой как десятичным разделителем.
+                char tail[128];
+                snprintf(tail, sizeof(tail), "%s", colon + 1);
+                for (char* p = tail; *p != '\0'; ++p) {
+                    if (*p == ',') *p = '.';
+                }
+                have_numbers = sscanf(tail, " %lf %*s / %lf", &spent, &limit) == 2;
+            }
+        }
+        if (have_numbers) {
+            // В русском десятичный разделитель — запятая. Сервер присылает
+            // «100,22 руб. / 100,00 руб.», и в таком же виде человеку привычнее.
+            // Меняем только точки между цифрами: точки в конце предложений
+            // трогать нельзя.
+            snprintf(out, out_len, "Лимит трат по ключу исчерпан: %.2f из %.2f руб. Пополните баланс.", spent, limit);
+            for (char* p = out + 1; *p != '\0'; ++p) {
+                const bool digits_around = (p[-1] >= '0' && p[-1] <= '9') && (p[1] >= '0' && p[1] <= '9');
+                if (*p == '.' && digits_around) *p = ',';
+            }
+        } else {
+            snprintf(out, out_len, "Лимит трат по ключу исчерпан. Пополните баланс.");
+        }
+        return true;
+    }
+
     if (error.isNull()) {
         const char* message = doc["message"].as<const char*>();
         if (message != nullptr && message[0] != '\0') {
@@ -325,6 +375,44 @@ const char* http_error_text(int http_code)
     case 504: return "Сервис недоступен";
     default: return "Ошибка сети";
     }
+}
+
+bool quota_exhausted(int http_code, const char* json, size_t len)
+{
+    // Лимит приходит с 429, но на всякий случай смотрим и 402: у разных
+    // провайдеров «кончились деньги» кодируется по-разному.
+    if (http_code != 429 && http_code != 402) return false;
+
+    if (json == nullptr || len == 0) return http_code == 402;
+
+    // Ищем по тексту, а не по полю `code`: в теле 429 поле `code` равно 429 —
+    // это тот же HTTP-код, а не признак лимита.
+    //
+    // Подстроки подобраны по тем формулировкам, которые встречаются у RouterAI
+    // и OpenAI-совместимых шлюзов. Регистр не важен: сервер пишет и
+    // `spending limit`, и `Spending Limit`.
+    static const char* const kMarkers[] = {
+        "spending limit",
+        "quota",
+        "insufficient",
+        "exceeded your current",
+        "billing",
+        "закончился баланс",
+        "лимит",
+    };
+
+    char lower[512];
+    const size_t copy = len < sizeof(lower) - 1 ? len : sizeof(lower) - 1;
+    for (size_t i = 0; i < copy; ++i) {
+        const char c = json[i];
+        lower[i] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    }
+    lower[copy] = '\0';
+
+    for (const char* marker : kMarkers) {
+        if (strstr(lower, marker) != nullptr) return true;
+    }
+    return false;
 }
 
 }  // namespace api

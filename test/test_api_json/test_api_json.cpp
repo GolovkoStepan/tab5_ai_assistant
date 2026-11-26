@@ -495,6 +495,51 @@ void test_error_402_balance()
     TEST_ASSERT_EQUAL_STRING("Закончился баланс", out);
 }
 
+/// Лимит трат по ключу: RouterAI отвечает 429 и английским текстом про
+/// «weekly spending limit». Раньше устройство дважды повторяло запрос и
+/// показывало эту строку как есть — по ней не понять, что делать.
+void test_error_quota_exhausted_is_explained_in_russian()
+{
+    const char* body =
+        R"J({"error":{"message":"API key weekly spending limit exceeded: 100,22 руб. / 100,00 руб.","code":429}})J";
+
+    char out[160];
+    TEST_ASSERT_TRUE(api::parse_error(body, strlen(body), 429, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("Лимит трат по ключу исчерпан: 100,22 из 100,00 руб. Пополните баланс.", out);
+}
+
+void test_error_quota_without_numbers_still_explained()
+{
+    const char* body = R"J({"error":{"message":"You exceeded your current quota"}})J";
+    char out[160];
+    TEST_ASSERT_TRUE(api::parse_error(body, strlen(body), 429, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("Лимит трат по ключу исчерпан. Пополните баланс.", out);
+}
+
+/// Обычный 429 («слишком часто») остаётся обычным: он лечится паузой, и
+/// путать его с «кончились деньги» нельзя.
+void test_error_plain_429_is_not_quota()
+{
+    TEST_ASSERT_FALSE(api::quota_exhausted(429, "{\"error\":\"Rate limit reached\"}", 29));
+    TEST_ASSERT_TRUE(api::quota_exhausted(429, "{\"error\":\"weekly spending limit exceeded\"}", 40));
+}
+
+void test_quota_exhausted_ignores_other_codes()
+{
+    TEST_ASSERT_FALSE(api::quota_exhausted(500, "{\"error\":\"quota\"}", 16));
+    TEST_ASSERT_FALSE(api::quota_exhausted(401, "{\"error\":\"quota\"}", 16));
+    // 402 — «закончился баланс» — лимит по определению.
+    TEST_ASSERT_TRUE(api::quota_exhausted(402, nullptr, 0));
+}
+
+void test_quota_marker_is_case_insensitive()
+{
+    const char* upper = "{\"error\":\"WEEKLY SPENDING LIMIT\"}";
+    TEST_ASSERT_TRUE(api::quota_exhausted(429, upper, strlen(upper)));
+    const char* body = "{\"error\":\"Insufficient balance\"}";
+    TEST_ASSERT_TRUE(api::quota_exhausted(429, body, strlen(body)));
+}
+
 /// tools передаются массивом как есть: реестр собирает схему, builder только
 /// переносит её в тело запроса.
 void test_tools_are_passed_through()
@@ -512,6 +557,37 @@ void test_tools_omitted_when_null()
     o.tools_json = nullptr;
     TEST_ASSERT_GREATER_THAN(0, api::build_request(nullptr, 0, o, g_buf, sizeof(g_buf)));
     TEST_ASSERT_NULL(strstr(g_buf, "\"tools\""));
+}
+
+/// Плагин ищет в интернете и живёт рядом с tools: раздельные запросы не нужны
+/// (Р-036). Здесь важно, что оба поля попадают в одно тело и между ними стоит
+/// запятая — иначе сервер ответит 400.
+void test_plugins_passed_alongside_tools()
+{
+    api::RequestOptions o = options();
+    o.tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"read_doc\"}}]";
+    o.plugins_json = "[{\"id\":\"web\",\"max_results\":3}]";
+
+    TEST_ASSERT_GREATER_THAN(0, api::build_request(nullptr, 0, o, g_buf, sizeof(g_buf)));
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "\"tools\":[{\"type\":\"function\""));
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "\"plugins\":[{\"id\":\"web\",\"max_results\":3}]"));
+    TEST_ASSERT_NOT_NULL(strstr(g_buf, "}],\"plugins\":"));
+}
+
+void test_plugins_omitted_when_null()
+{
+    api::RequestOptions o = options();
+    o.plugins_json = nullptr;
+    TEST_ASSERT_GREATER_THAN(0, api::build_request(nullptr, 0, o, g_buf, sizeof(g_buf)));
+    TEST_ASSERT_NULL(strstr(g_buf, "\"plugins\""));
+}
+
+void test_plugins_omitted_when_empty()
+{
+    api::RequestOptions o = options();
+    o.plugins_json = "";
+    TEST_ASSERT_GREATER_THAN(0, api::build_request(nullptr, 0, o, g_buf, sizeof(g_buf)));
+    TEST_ASSERT_NULL(strstr(g_buf, "\"plugins\""));
 }
 
 /// Ассистент с вызовами: content = null, tool_calls — массив. Это форма,
@@ -557,6 +633,9 @@ int main(int, char**)
 
     RUN_TEST(test_tools_are_passed_through);
     RUN_TEST(test_tools_omitted_when_null);
+    RUN_TEST(test_plugins_passed_alongside_tools);
+    RUN_TEST(test_plugins_omitted_when_null);
+    RUN_TEST(test_plugins_omitted_when_empty);
     RUN_TEST(test_assistant_message_with_tool_calls);
     RUN_TEST(test_tool_message_has_call_id);
     RUN_TEST(test_max_tokens_only_when_set);
@@ -591,5 +670,10 @@ int main(int, char**)
     RUN_TEST(test_error_empty_body_uses_code_text);
     RUN_TEST(test_error_html_body_uses_code_text);
     RUN_TEST(test_error_402_balance);
+    RUN_TEST(test_error_quota_exhausted_is_explained_in_russian);
+    RUN_TEST(test_error_quota_without_numbers_still_explained);
+    RUN_TEST(test_error_plain_429_is_not_quota);
+    RUN_TEST(test_quota_exhausted_ignores_other_codes);
+    RUN_TEST(test_quota_marker_is_case_insensitive);
     return UNITY_END();
 }

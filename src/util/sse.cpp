@@ -29,9 +29,12 @@ void Parser::reset()
     _event_overflow = false;
     _has_data = false;
 
-    _line_len = 0;
-    _line[0] = '\0';
-    _line_overflow = false;
+    _field_len = 0;
+    _field[0] = '\0';
+    _in_value = false;
+    _skip_space = false;
+    _line_is_data = false;
+    _line_has_bytes = false;
 
     _done = false;
     _dropped = 0;
@@ -69,53 +72,83 @@ bool Parser::dispatch()
     return true;
 }
 
-void Parser::handle_line(const char* line, size_t len)
+/// Принять байт строки. Значение `data:` уходит прямо в накопитель события;
+/// имя поля собирается отдельно (не длиннее kMaxFieldBytes).
+void Parser::put_char(char ch)
 {
-    // Пустая строка завершает событие. Именно здесь выдаётся результат, а не
-    // на каждом `data:` — иначе многострочное событие развалилось бы на части.
-    if (len == 0) {
-        dispatch();
+    if (!_in_value) {
+        // Имя поля уже не влезло в буфер: остаток имени и значение не нужны.
+        // Двоеточие просто переводит строку в режим «значение», и дальше
+        // _line_is_data (false) отсекает всё остальное. Иначе хвост длинного
+        // имени начал бы собираться заново и мог случайно совпасть с `data`.
+        if (_skip_field) {
+            if (ch == ':') _in_value = true;
+            return;
+        }
+
+        if (ch == ':') {
+            _in_value = true;
+            _skip_space = true;
+            _field[_field_len] = '\0';
+            _line_is_data = (_field_len == 4 && memcmp(_field, "data", 4) == 0);
+            if (_line_is_data) {
+                _has_data = true;
+                // Разделитель между строками многострочного data:.
+                if (_event_len > 0) {
+                    if (_event_len + 1 >= sizeof(_event)) {
+                        _event_overflow = true;
+                        return;
+                    }
+                    _event[_event_len++] = '\n';
+                }
+            }
+            return;
+        }
+
+        if (_field_len + 1 < sizeof(_field)) {
+            _field[_field_len++] = ch;
+        } else {
+            _field_len = 0;
+            _field[0] = '\0';
+            _skip_field = true;
+        }
         return;
     }
 
-    // Строка-комментарий (начинается с двоеточия) — heartbeat сервера.
-    if (line[0] == ':') return;
+    if (_skip_field) return;
 
-    // Поле и значение: `data: значение`. Пробел после двоеточия по формату
-    // необязателен и, если есть, в значение не входит.
-    size_t colon = 0;
-    while (colon < len && line[colon] != ':')
-        ++colon;
-
-    const char* value = line + (colon < len ? colon + 1 : len);
-    size_t value_len = len - (colon < len ? colon + 1 : len);
-    if (value_len > 0 && *value == ' ') {
-        ++value;
-        --value_len;
+    // Двоеточие встречено. Один пробел после него — разделитель, не данные.
+    if (_skip_space) {
+        _skip_space = false;
+        if (ch == ' ') return;
     }
 
-    if (colon != 4 || memcmp(line, "data", 4) != 0) return;  // не data:
+    if (!_line_is_data) return;  // значения служебных полей не нужны
 
-    _has_data = true;
-
-    // Добавляем перевод строки как разделитель многострочного `data:` —
-    // формат SSE требует склеивать строки именно через \n.
-    if (_event_len > 0) {
-        if (_event_len + 1 >= sizeof(_event)) {
-            _event_overflow = true;
-            return;
-        }
-        _event[_event_len++] = '\n';
-    }
-
-    if (_event_len + value_len >= sizeof(_event)) {
+    if (_event_len + 1 >= sizeof(_event)) {
         _event_overflow = true;
         return;
     }
-
-    memcpy(_event + _event_len, value, value_len);
-    _event_len += value_len;
+    _event[_event_len++] = ch;
     _event[_event_len] = '\0';
+}
+
+/// Завершить строку: пустая строка выдаёт накопленное событие.
+void Parser::end_line()
+{
+    // Пустая строка (в том числе после `\r`) — конец события.
+    if (!_line_has_bytes) {
+        dispatch();
+    }
+
+    // Следующая строка начинается с чистого листа.
+    _field_len = 0;
+    _field[0] = '\0';
+    _in_value = false;
+    _skip_space = false;
+    _skip_field = false;
+    _line_is_data = false;
+    _line_has_bytes = false;
 }
 
 bool Parser::feed(const char* data, size_t len)
@@ -126,30 +159,18 @@ bool Parser::feed(const char* data, size_t len)
         const char ch = data[i];
 
         if (ch != '\n') {
-            // Строка длиннее буфера — значит, пришло что-то не то. Событие
-            // будет выброшено, но парсер не должен «залипнуть» на строке.
-            if (_line_len + 1 < sizeof(_line)) {
-                _line[_line_len++] = ch;
-            } else {
-                _line_overflow = true;
+            // \r перед \n — часть разделителя строк в HTTP, в данные не входит.
+            // Встретить его можно только в конце строки, поэтому запоминаем
+            // факт байта, а сам \r не пишем.
+            if (ch == '\r') {
+                continue;
             }
+            _line_has_bytes = true;
+            put_char(ch);
             continue;
         }
 
-        // \r перед \n — часть разделителя строк в HTTP, в данные не входит.
-        if (_line_len > 0 && _line[_line_len - 1] == '\r') --_line_len;
-
-        if (_line_overflow) {
-            _line_overflow = false;
-            _line_len = 0;
-            // Обрывок строки мог быть частью события — выбрасываем его целиком.
-            _event_overflow = true;
-            continue;
-        }
-
-        _line[_line_len] = '\0';
-        handle_line(_line, _line_len);
-        _line_len = 0;
+        end_line();
     }
 
     return !_done;
