@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-11-26
+
 ### Добавлено
 
 - **Заставка при включении.** Раньше первые секунды после подачи питания экран
@@ -36,11 +38,11 @@
 - `util/tray_state` — правила выбора содержимого трея без зависимости от
   Arduino: когда процент заряда достоверен, как отличить «заряжается» от
   «заряжен», почему уровень сигнала при `RSSI == 0` — ноль палочек, а не
-  четыре. 28 тестов на хосте.
+  четыре. 33 теста на хосте.
 - `ui/tray` — геометрия и отрисовка: палочки сигнала и корпус батареи рисуются
   примитивами, потому что блочных глифов (`▁▄█`, `░`, `▪`, `⚡`) в
   `efontJA_16` нет. Порядок справа налево — Wi-Fi, затем батарея: значок связи
-  стоит у самого края, как в macOS, группы разделены небольшим зазором 10 px.
+  стоит у самого края, как в macOS, группы разделены небольшим зазором 6 px.
 
 ### Исправлено
 
@@ -660,7 +662,8 @@ SD-карте, а у человека появляется экран архив
 - Юнит-тесты на хосте: 78 тестов (форматирование, раскладка, настройки, список
   сетей), `./scripts/check.sh docker` зелёный.
 
-[Unreleased]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.1.0...v0.2.0
 [v0.1.0]: https://github.com/GolovkoStepan/tab5_ai_assistant/releases/tag/v0.1.0
