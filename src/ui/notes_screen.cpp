@@ -22,6 +22,7 @@
 #include "hw/clock.h"
 #include "ui/draw.h"
 #include "ui/tray.h"
+#include "util/list_page.h"
 #include "util/text_layout.h"
 
 namespace ui {
@@ -215,15 +216,79 @@ bool NotesScreen::dirty() const
 
 void NotesScreen::reload()
 {
-    _count = 0;
+    _page_offset = 0;
+    _total = 0;
     _from_search = false;
-    _list_valid = false;
-    if (_docs == nullptr || _row_offsets == nullptr || !_docs->ready()) return;
+    reload_page();
+}
 
-    _count = _docs->list("", _items, kMaxListedDocs);
+void NotesScreen::reload_page()
+{
+    _count = 0;
+    _list_valid = false;
+    if (_docs == nullptr || _row_offsets == nullptr || !_docs->ready()) {
+        _total = 0;
+        return;
+    }
+
+    _count = _docs->list_from("", _page_offset, _items, kMaxListedDocs);
+
+    // Сколько ВСЕГО документов: list_from() копит его в _total_found, даже
+    // когда страница короткая. Без этого заголовок врал бы «Документы: 60»
+    // про архив из 137 файлов, и человек считал бы, что остальных нет.
+    _total = _docs->total_found();
+
+    if (_total == 0) _page_offset = 0;
     if (_selected >= static_cast<int>(_count)) _selected = _count > 0 ? static_cast<int>(_count) - 1 : 0;
     if (_selected < 0) _selected = 0;
     clamp_scroll();
+
+    // В журнал — счётом, а не глазами: «страница перевернулась и показала
+    // другие документы» иначе проверяется только у экрана (Р-046).
+    Serial.printf("Архив: показано %u из %u, со смещения %u\n", static_cast<unsigned>(shown_count()),
+        static_cast<unsigned>(_total), static_cast<unsigned>(_page_offset));
+}
+
+bool NotesScreen::has_next_page() const
+{
+    // У результатов поиска страниц нет: search() читает весь архив и отдаёт
+    // первые kMaxListedDocs совпадений. Разрешить здесь страницу значило бы,
+    // что → из результатов молча показала бы страницу ОБЫЧНОГО списка, и
+    // найденное пропало бы с экрана без объяснения.
+    if (_from_search) return false;
+    return shown_count() < _total;
+}
+
+void NotesScreen::next_page()
+{
+    if (!has_next_page()) return;
+
+    const size_t step = _count > 0 ? _count : kMaxListedDocs;
+    const size_t next = listpage::next_offset(_total, _page_offset, step);
+    if (next == _page_offset) return;
+
+    _page_offset = next;
+    reload_page();
+    // После переворота страницы выделяем первую строку: иначе выбор остался бы
+    // на той же высоте, но уже другой записи, и Enter открыл бы не то, что
+    // человек видел.
+    _selected = 0;
+    _first = 0;
+    _redraw_all = true;
+}
+
+void NotesScreen::prev_page()
+{
+    if (!has_prev_page()) return;
+
+    const size_t step = kMaxListedDocs;
+    _page_offset = _page_offset > step ? _page_offset - step : 0;
+    reload_page();
+    // Назад — в конец страницы, чтобы переход выглядел как прокрутка, а не
+    // как прыжок в начало.
+    _selected = _count > 0 ? static_cast<int>(_count) - 1 : 0;
+    clamp_scroll();
+    _redraw_all = true;
 }
 
 void NotesScreen::clamp_scroll()
@@ -368,7 +433,24 @@ void NotesScreen::save_edit()
     // не было (документ без фронтматтера), берём имя файла: без заголовка
     // DocStore::write откажет, и заметка перестала бы сохраняться.
     doc::Meta meta = _meta;
-    if (meta.title[0] == '\0') {
+
+    // Заметка, созданная руками, живёт в inbox/ со служебным именем — название
+    // человек пишет в теле (Р-050). Заголовок обновляется из первой строки при
+    // каждом сохранении: правка текста должна менять и название в списке.
+    bool title_from_body = paths::is_inbox(_rel);
+    if (title_from_body) {
+        if (doc::title_from_body(_ed.data, _ed.len, meta.title, sizeof(meta.title)) == 0) {
+            // Тело пустое — названия нет. Подставляем дату: без заголовка
+            // DocStore::write откажет, и заметка перестала бы сохраняться.
+            char ts[32];
+            if (_settings != nullptr && hw::clock_sync::now_iso(_settings->config(), ts, sizeof(ts))) {
+                // «2026-11-27T16:15:00+03:00» → «Заметка 2026-11-27 16:15».
+                snprintf(meta.title, sizeof(meta.title), "Заметка %.10s %.5s", ts, ts + 11);
+            } else {
+                snprintf(meta.title, sizeof(meta.title), "Заметка");
+            }
+        }
+    } else if (meta.title[0] == '\0') {
         // Без заголовка DocStore::write откажет, и заметка перестала бы
         // сохраняться. Берём имя файла, но без «.md»: «air-purifier.md» в
         // списке читалось бы как имя файла, а не как заголовок.
@@ -601,6 +683,12 @@ bool NotesScreen::onKey(const hw::KeyEvent& ev)
     }
 
     // --- Список ---
+    // Ctrl+N — новая заметка (Р-050). «т» — та же клавиша в ЙЦУКЕН.
+    if (is_ctrl(ev, "n", "т")) {
+        new_note();
+        return false;
+    }
+
     // «/» — поиск. В ЙЦУКЕН на этой клавише «.» (символ «ю»), поэтому
     // принимаем оба: подсказка обещает поиск по «/», а набрать его в русской
     // раскладке нельзя.
@@ -635,6 +723,32 @@ bool NotesScreen::onKey(const hw::KeyEvent& ev)
         open_selected();
         return false;
     }
+    // ← → — страницы списка (v1.1.0). Стрелки вверх/вниз двигают выбор, а
+    // страницы нужны, когда документов больше, чем влезает в список: до этого
+    // остаток архива был недостижим вообще.
+    if (is_special(ev, keymap::Special::Right)) {
+        if (has_next_page()) {
+            next_page();
+        } else if (_from_search) {
+            // Совпадений больше, чем влезает в список, а листать их нечем:
+            // говорим об этом прямо, иначе «→ ничего не делает» читалось бы
+            // как поломка.
+            if (_total > _count) {
+                notice("Совпадений больше, чем влезает — уточните запрос");
+            }
+        } else {
+            notice("Это последняя страница архива");
+        }
+        return false;
+    }
+    if (is_special(ev, keymap::Special::Left)) {
+        if (has_prev_page()) {
+            prev_page();
+        } else if (!_from_search) {
+            notice("Это первая страница архива");
+        }
+        return false;
+    }
     if (is_special(ev, keymap::Special::Delete)) {
         if (_count > 0) {
             _confirm = ConfirmKind::Delete;
@@ -644,6 +758,57 @@ bool NotesScreen::onKey(const hw::KeyEvent& ev)
         return false;
     }
     return false;
+}
+
+bool NotesScreen::make_inbox_path(char* out, size_t out_len)
+{
+    char ts[32];
+    if (_settings == nullptr || !hw::clock_sync::now_iso(_settings->config(), ts, sizeof(ts))) return false;
+    return paths::inbox_path(ts, "note", out, out_len);
+}
+
+void NotesScreen::new_note()
+{
+    if (_docs == nullptr || _text == nullptr || _ed.data == nullptr) {
+        fail("Не хватило памяти под документ");
+        return;
+    }
+
+    char rel[paths::kMaxPathLen];
+    if (!make_inbox_path(rel, sizeof(rel))) {
+        // Без времени в имени две заметки подряд получили бы одно имя, и вторая
+        // молча затёрла бы первую. Лучше отказать, чем потерять текст.
+        fail("Часы не выставлены: заметку не назвать. Ctrl+W — сеть для NTP");
+        return;
+    }
+
+    // Проверяем, что такого файла ещё нет: создание через N+1 секунду могло
+    // совпасть с именем, а write() перезаписал бы чужую заметку.
+    if (_docs->exists(rel)) {
+        fail("Файл с таким временем уже есть — повторите через секунду");
+        return;
+    }
+
+    textedit::load(_ed, _text, kMaxDocBytes + 1, "", 0);
+
+    snprintf(_rel, sizeof(_rel), "%s", rel);
+    _meta = doc::Meta{};
+
+    // Заголовок и дата создадутся при сохранении: сейчас тело пустое, и
+    // придумывать название за человека незачем.
+    _dirty = false;
+    _scroll = 0;
+    _desired_col = 0;
+    _mode = Mode::Edit;
+    _from_search = false;
+    _error[0] = '\0';
+    _notice_ok = false;
+
+    after_edit(false);
+    _scroll = 0;
+    _redraw_all = true;
+
+    notice("Новая заметка · напишите название первой строкой, Ctrl+S — сохранить");
 }
 
 void NotesScreen::run_search()
@@ -670,8 +835,27 @@ void NotesScreen::run_search()
     _list_valid = false;
     _mode = Mode::List;
 
+    // Поиск отдаёт не больше kMaxListedDocs и о страницах не знает: он читает
+    // весь архив и обрезает результат. Поэтому offset обнуляем — иначе «N из M»
+    // прибавило бы смещение полного списка к результатам поиска.
+    //
+    // Всего совпадений берём из total_found(), а не из _count: search() считает
+    // их ВСЕ, включая не влезшие в страницу. Иначе «Документы: 60 из 60» врало
+    // бы про архив, где совпадений 137, и человек считал бы, что остальных нет.
+    _page_offset = 0;
+    const size_t matches = _docs->total_found();
+    _total = matches > _count ? matches : _count;
+
+    Serial.printf("Архив: поиск «%s» — совпадений %u, показано %u\n", _query, static_cast<unsigned>(_total),
+        static_cast<unsigned>(_count));
+
     if (_count == 0) {
         notice("Ничего не найдено · Esc — полный список");
+    } else if (_total > _count) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Найдено: %u, показано %u · Esc — полный список", static_cast<unsigned>(found),
+            static_cast<unsigned>(_count));
+        notice(msg);
     } else {
         char msg[96];
         snprintf(msg, sizeof(msg), "Найдено: %u · Esc — полный список", static_cast<unsigned>(_count));
@@ -905,9 +1089,19 @@ void NotesScreen::draw_header()
     }
 
     if (_from_search) {
-        snprintf(buf, sizeof(buf), "Найдено: %u", static_cast<unsigned>(_count));
+        // «Найдено: 60 из 137» — иначе человек считал, что нашлось ровно 60,
+        // хотя список обрезан пределом.
+        listpage::label("Найдено", _total, _count, buf, sizeof(buf));
     } else {
-        snprintf(buf, sizeof(buf), "Документы: %u", static_cast<unsigned>(_count));
+        // «Документы: 60 из 137» и номер страницы, если она не первая.
+        char* p = buf;
+        size_t left = sizeof(buf);
+        const size_t written = listpage::label("Документы", _total, shown_count(), p, left);
+        if (written > 0 && _page_offset > 0) {
+            p += written;
+            left -= written;
+            snprintf(p, left, " · с %u", static_cast<unsigned>(_page_offset + 1));
+        }
     }
     ui::text(buf, kMargin, kHeaderY, TFT_WHITE);
 
@@ -1179,8 +1373,27 @@ void NotesScreen::draw_hints()
         ui::text("Enter — править · ↑↓ — прокрутка · Esc — к списку", kMargin, ui::kHintY, kColorFaint);
         return;
     }
-    ui::text(
-        "↑↓ — выбор · Enter — открыть · / — поиск · Del — удалить · Esc — в чат", kMargin, ui::kHintY, kColorFaint);
+    // Подсказка о страницах — только когда они есть: на архиве из пяти
+    // документов «← →» занимали бы место, ничего не делая.
+    if (!_from_search && (_total > _count || _page_offset > 0)) {
+        const size_t more = _total > shown_count() ? _total - shown_count() : 0;
+        if (more > 0) {
+            char hint[64];
+            if (listpage::more_hint(more, hint, sizeof(hint)) > 0) {
+                char line[160];
+                snprintf(
+                    line, sizeof(line), "↑↓ — выбор · Enter — открыть · %s · ← назад · / — поиск · Esc — в чат", hint);
+                ui::text(line, kMargin, ui::kHintY, kColorFaint);
+                return;
+            }
+        }
+        ui::text("↑↓ — выбор · Enter — открыть · ← → — страницы · / — поиск · Esc — в чат", kMargin, ui::kHintY,
+            kColorFaint);
+        return;
+    }
+
+    ui::text("↑↓ — выбор · Enter — открыть · Ctrl+N — новая · / — поиск · Del — удалить · Esc — в чат", kMargin,
+        ui::kHintY, kColorFaint);
 }
 
 void NotesScreen::fail(const char* text)

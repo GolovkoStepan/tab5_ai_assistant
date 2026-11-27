@@ -159,6 +159,11 @@ bool DocStore::read_meta(const char* rel, doc::Meta& meta, size_t* file_bytes)
 
 void DocStore::walk(const char* rel_folder, docapi::Entry* out, size_t cap, size_t depth)
 {
+    walk_from(rel_folder, 0, out, cap, depth);
+}
+
+void DocStore::walk_from(const char* rel_folder, size_t skip, docapi::Entry* out, size_t cap, size_t depth)
+{
     // Глубже kMaxDepth не ходим: paths::check всё равно не пустит такой путь,
     // а каталог с мусором мог бы оказаться сколь угодно глубоким.
     if (depth > paths::kMaxDepth) return;
@@ -199,7 +204,7 @@ void DocStore::walk(const char* rel_folder, docapi::Entry* out, size_t cap, size
         }
 
         if (is_dir) {
-            walk(rel, out, cap, depth + 1);
+            walk_from(rel, skip, out, cap, depth + 1);
             continue;
         }
 
@@ -218,9 +223,14 @@ void DocStore::walk(const char* rel_folder, docapi::Entry* out, size_t cap, size
         if (paths::check(rel) != paths::Result::Ok) continue;
 
         _total_found += 1;
-        if (_total_found > cap) continue;
+        // Страница списка: первые skip документов пропускаем, но считаем —
+        // total_found() должен честно сказать, сколько их всего. Иначе экран
+        // показывал бы «Документы: 60» про архив из 137 файлов.
+        if (_total_found <= skip) continue;
+        const size_t index = _total_found - 1 - skip;
+        if (index >= cap) continue;
 
-        docapi::Entry& e = out[_total_found - 1];
+        docapi::Entry& e = out[index];
         e = docapi::Entry{};
         snprintf(e.path, sizeof(e.path), "%s", rel);
         e.bytes = size;
@@ -237,12 +247,19 @@ void DocStore::walk(const char* rel_folder, docapi::Entry* out, size_t cap, size
 
 size_t DocStore::list(const char* folder, docapi::Entry* out, size_t cap)
 {
+    return list_from(folder, 0, out, cap);
+}
+
+size_t DocStore::list_from(const char* folder, size_t skip, docapi::Entry* out, size_t cap)
+{
     _total_found = 0;
     if (!_ready || out == nullptr || cap == 0) return 0;
     if (cap > kMaxListedDocs) cap = kMaxListedDocs;
 
-    walk(folder != nullptr ? folder : "", out, cap, 0);
-    return _total_found < cap ? _total_found : cap;
+    walk_from(folder != nullptr ? folder : "", skip, out, cap, 0);
+    if (_total_found <= skip) return 0;
+    const size_t left = _total_found - skip;
+    return left < cap ? left : cap;
 }
 
 bool DocStore::read(
@@ -383,45 +400,67 @@ bool DocStore::remove(const char* rel, char* err, size_t err_len)
 
 size_t DocStore::search(const char* query, size_t limit, docapi::Hit* out, size_t cap)
 {
+    _total_found = 0;
     if (!_ready || query == nullptr || query[0] == '\0' || out == nullptr || cap == 0) return 0;
     if (limit == 0 || limit > cap) limit = cap;
 
     // Собираем все документы и ищем в каждом. Для архива на десятки файлов
     // этого достаточно, а индекс с обратным словником — отдельная работа,
     // которая оправдается на сотнях.
+    //
+    // Идём страницами list_from(), а не одним list(): тот отдаёт не больше
+    // kMaxListedDocs, и в архиве из 137 документов поиск молча не смотрел бы
+    // дальше 60-го — то есть «моей заметки тут нет» было бы неправдой.
     if (!ensure_entries()) return 0;
     docapi::Entry* entries = _entries;
-    const size_t found = list("", entries, kMaxListedDocs);
-    if (found == 0) return 0;
 
     const size_t qlen = strlen(query);
     size_t hits = 0;
+    size_t matches = 0;
+    size_t skip = 0;
 
-    for (size_t i = 0; i < found && hits < limit; ++i) {
-        doc::Meta meta;
-        size_t body_len = 0;
-        if (!read(entries[i].path, meta, _body, kMaxDocBytes, &body_len, nullptr, 0)) continue;
+    while (skip < kSearchScanLimit) {
+        const size_t found = list_from("", skip, entries, kMaxListedDocs);
+        if (found == 0) break;
 
-        // Сначала заголовок: если слово в заголовке — это более релевантный
-        // результат, чем совпадение в середине текста.
-        const char* where = docsearch::find_ci(meta.title, strlen(meta.title), query, qlen);
-        if (where != nullptr) {
+        for (size_t i = 0; i < found; ++i) {
+            doc::Meta meta;
+            size_t body_len = 0;
+            if (!read(entries[i].path, meta, _body, kMaxDocBytes, &body_len, nullptr, 0)) continue;
+
+            // Сначала заголовок: если слово в заголовке — это более релевантный
+            // результат, чем совпадение в середине текста.
+            const char* where = docsearch::find_ci(meta.title, strlen(meta.title), query, qlen);
+            const char* text = meta.title;
+            size_t text_len = strlen(meta.title);
+            size_t width = 40;
+            if (where == nullptr) {
+                text = _body;
+                text_len = body_len;
+                width = 48;
+                where = docsearch::find_ci(_body, body_len, query, qlen);
+                if (where == nullptr) continue;
+            }
+
+            // Считаем все совпадения, а сохраняем только первые limit: иначе
+            // экран не смог бы сказать «найдено больше, чем показано».
+            ++matches;
+            if (hits >= limit) continue;
+
             docapi::Hit& h = out[hits++];
             h = docapi::Hit{};
             snprintf(h.path, sizeof(h.path), "%s", entries[i].path);
-            docsearch::snippet(meta.title, strlen(meta.title), static_cast<size_t>(where - meta.title), qlen, 40,
-                h.snippet, sizeof(h.snippet));
-            continue;
+            docsearch::snippet(
+                text, text_len, static_cast<size_t>(where - text), qlen, width, h.snippet, sizeof(h.snippet));
         }
 
-        where = docsearch::find_ci(_body, body_len, query, qlen);
-        if (where == nullptr) continue;
-
-        docapi::Hit& h = out[hits++];
-        h = docapi::Hit{};
-        snprintf(h.path, sizeof(h.path), "%s", entries[i].path);
-        docsearch::snippet(_body, body_len, static_cast<size_t>(where - _body), qlen, 48, h.snippet, sizeof(h.snippet));
+        if (found < kMaxListedDocs) break;
+        skip += found;
     }
+
+    // После поиска total_found() — число СОВПАДЕНИЙ, а не документов: экран
+    // показывает «найдено M», и ему нужно именно это.
+    _total_found = matches;
     return hits;
 }
 

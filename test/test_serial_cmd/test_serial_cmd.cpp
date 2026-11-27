@@ -2,6 +2,9 @@
 
 #include <string.h>
 
+#include <string>
+#include <utility>
+
 #include "util/serial_cmd.h"
 
 namespace {
@@ -376,6 +379,59 @@ void test_parse_new_thread()
     TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Kind::Unknown), static_cast<int>(kind_of("newdoc")));
 }
 
+/// `screen settings` — экран «Параметры»: без него яркость и пороги разряда
+/// иначе проверяются только руками.
+void test_screen_settings()
+{
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Screen::Settings),
+        static_cast<int>(serialcmd::parse_screen("settings", strlen("settings"))));
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Screen::Settings),
+        static_cast<int>(serialcmd::parse_screen("параметры", strlen("параметры"))));
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Screen::None),
+        static_cast<int>(serialcmd::parse_screen("settingsx", strlen("settingsx"))));
+}
+
+/// `dev <шаг>` — то же, что стрелки на экране параметров.
+void test_parse_dev_step()
+{
+    auto step_of = [](const char* line) {
+        const char* text = nullptr;
+        size_t len = 0;
+        const serialcmd::Kind kind = serialcmd::parse(line, strlen(line), &text, &len);
+        return std::make_pair(kind, std::string(text != nullptr ? text : "", len));
+    };
+
+    {
+        auto r = step_of("dev bright+1");
+        TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Kind::DevStep), static_cast<int>(r.first));
+        TEST_ASSERT_EQUAL_STRING("bright+1", r.second.c_str());
+    }
+    {
+        auto r = step_of("DEV save");
+        TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Kind::DevStep), static_cast<int>(r.first));
+        TEST_ASSERT_EQUAL_STRING("save", r.second.c_str());
+    }
+    // Голое `dev` — не команда, а просьба о подсказке.
+    TEST_ASSERT_EQUAL(
+        static_cast<int>(serialcmd::Kind::Help), static_cast<int>(serialcmd::parse("dev", 3, nullptr, nullptr)));
+    // Слово целиком, как у `new`: `device` — не команда.
+    TEST_ASSERT_EQUAL(
+        static_cast<int>(serialcmd::Kind::Unknown), static_cast<int>(serialcmd::parse("device", 6, nullptr, nullptr)));
+}
+
+/// `save` — сохранить ответ в архив без клавиатуры: то же, что Ctrl+S.
+void test_parse_save_answer()
+{
+    auto kind_of = [](const char* line) { return serialcmd::parse(line, strlen(line), nullptr, nullptr); };
+
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Kind::SaveAnswer), static_cast<int>(kind_of("save")));
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Kind::SaveAnswer), static_cast<int>(kind_of("SAVE")));
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Kind::SaveAnswer), static_cast<int>(kind_of("  save  ")));
+
+    // Не команда: слово целиком, как у `new`.
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Kind::Unknown), static_cast<int>(kind_of("saveall")));
+}
+
 int main(int, char**)
 {
     UNITY_BEGIN();
@@ -412,5 +468,8 @@ int main(int, char**)
     RUN_TEST(test_cyrillic_whole_question);
     RUN_TEST(test_single_char_question);
     RUN_TEST(test_parse_new_thread);
+    RUN_TEST(test_parse_save_answer);
+    RUN_TEST(test_screen_settings);
+    RUN_TEST(test_parse_dev_step);
     return UNITY_END();
 }

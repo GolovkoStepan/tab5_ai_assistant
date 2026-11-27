@@ -26,6 +26,9 @@ namespace ui {
 
 class ThreadsScreen {
 public:
+    /// Длина поискового запроса.
+    static constexpr size_t kMaxQuery = 64;
+
     /// Привязать к хранилищу. Вызывается один раз в setup().
     void init(hw::ChatStore& store);
 
@@ -94,7 +97,24 @@ public:
 
 private:
     void reload();
+    /// Перечитать страницу, начиная с `_page_offset`.
+    void reload_page();
     void clamp_scroll();
+
+    /// Есть ли треды дальше показанной страницы.
+    bool has_next_page() const { return shown_count() < _total; }
+    /// Есть ли треды до показанной страницы.
+    bool has_prev_page() const { return _page_offset > 0; }
+    void next_page();
+    void prev_page();
+    /// Сколько показано с учётом страницы — для «N из M».
+    size_t shown_count() const { return _page_offset + _count; }
+    /// Начать ввод поискового запроса.
+    void begin_search();
+    /// Выполнить поиск по введённому запросу.
+    void run_search();
+    /// Отменить поиск и вернуться к полному списку.
+    void clear_search();
 
     /// Перерисовать две строки, между которыми переехал выбор.
     ///
@@ -136,6 +156,14 @@ private:
     /// Список с карты. Заполняется reload().
     hw::ChatStore::ThreadInfo _items[hw::ChatStore::kMaxListedThreads]{};
     size_t _count{0};
+    /// Сколько тредов всего (или найдено поиском) — для «N из M».
+    size_t _total{0};
+    /// С какого треда начинается показанная страница.
+    size_t _page_offset{0};
+    /// Идёт ввод поискового запроса: клавиши набирают текст, а не двигают выбор.
+    bool _searching{false};
+    bool _from_search{false};
+    char _query[kMaxQuery]{};
     int _selected{0};
     /// Прокрутка: первая показанная строка.
     int _first{0};

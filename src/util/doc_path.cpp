@@ -2,6 +2,7 @@
 
 #include "util/doc_path.h"
 
+#include <stdio.h>
 #include <string.h>
 
 namespace paths {
@@ -328,6 +329,67 @@ void name_of(const char* path, char* out, size_t out_len)
     if (n + 1 > out_len) n = out_len - 1;
     memcpy(out, name, n);
     out[n] = '\0';
+}
+
+bool is_inbox(const char* path)
+{
+    if (path == nullptr) return false;
+    static const char kPrefix[] = "inbox/";
+    const size_t n = sizeof(kPrefix) - 1;
+    return strncmp(path, kPrefix, n) == 0 && path[n] != '\0';
+}
+
+bool inbox_path(const char* iso, const char* prefix, char* out, size_t out_len)
+{
+    if (out == nullptr || out_len < kMaxPathLen) return false;
+    out[0] = '\0';
+    if (iso == nullptr || prefix == nullptr) return false;
+
+    // Префикс проверяем по списку: он попадает в имя файла, а значит — в путь,
+    // который потом проверяет check(). Произвольная строка оттуда не пройдёт,
+    // но отказ должен быть здесь, а не после записи.
+    if (strcmp(prefix, "note") != 0 && strcmp(prefix, "answer") != 0) return false;
+
+    // ISO-8601: `ГГГГ-ММ-ДДTЧЧ:ММ:СС±ЧЧ:ММ`. Нужны только дата и время, и
+    // проверяем их по позициям: «2026-13-45» дал бы имя, которое не сортируется
+    // по времени, хотя выглядит правильным.
+    static constexpr size_t kStampLen = 19;  // «2026-11-27T16:15:00»
+    if (strlen(iso) < kStampLen) return false;
+    for (size_t k = 0; k < kStampLen; ++k) {
+        const char c = iso[k];
+        if (k == 4 || k == 7) {
+            if (c != '-') return false;
+        } else if (k == 10) {
+            if (c != 'T') return false;
+        } else if (k == 13 || k == 16) {
+            if (c != ':') return false;
+        } else if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+
+    const size_t year = (iso[0] - '0') * 1000 + (iso[1] - '0') * 100 + (iso[2] - '0') * 10 + (iso[3] - '0');
+    const size_t month = (iso[5] - '0') * 10 + (iso[6] - '0');
+    const size_t day = (iso[8] - '0') * 10 + (iso[9] - '0');
+    const size_t hour = (iso[11] - '0') * 10 + (iso[12] - '0');
+    const size_t minute = (iso[14] - '0') * 10 + (iso[15] - '0');
+    const size_t second = (iso[17] - '0') * 10 + (iso[18] - '0');
+    if (year < 2020 || year > 2099) return false;
+    if (month < 1 || month > 12) return false;
+    if (day < 1 || day > 31) return false;
+    if (hour > 23 || minute > 59 || second > 59) return false;
+
+    const int n = snprintf(out, out_len, "inbox/%s-%04u%02u%02u-%02u%02u%02u.md", prefix, static_cast<unsigned>(year),
+        static_cast<unsigned>(month), static_cast<unsigned>(day), static_cast<unsigned>(hour),
+        static_cast<unsigned>(minute), static_cast<unsigned>(second));
+    if (n <= 0 || static_cast<size_t>(n) + 1 > out_len) {
+        out[0] = '\0';
+        return false;
+    }
+
+    // Проверка тем же правилом, что и для пути от модели: если имя когда-нибудь
+    // разойдётся с ограничениями, отказ будет здесь, а не при записи.
+    return check(out) == Result::Ok;
 }
 
 }  // namespace paths

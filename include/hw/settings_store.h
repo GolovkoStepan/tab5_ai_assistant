@@ -65,6 +65,14 @@ public:
     /// настроек API их не редактирует.
     bool set_api_settings(const settings::Config& cfg, char* err, size_t err_len);
 
+    /// Заменить параметры устройства (яркость, таймаут подсветки, раскладка,
+    /// пороги разряда, таймзона) и сохранить файл.
+    ///
+    /// Зеркало set_api_settings: здесь меняются поля устройства, а поля API
+    /// берутся из СВОИХ настроек. Иначе сохранение яркости вернуло бы адрес
+    /// API к тому, что был при входе в экран.
+    bool set_device_settings(const settings::Config& cfg, char* err, size_t err_len);
+
     /// Проверить текущий конфиг на корректность (см. settings::validate).
     bool validate(char* err, size_t err_len) const { return settings::validate(_config, err, err_len); }
 

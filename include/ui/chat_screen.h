@@ -26,6 +26,8 @@
 #include "util/chat_view.h"
 #include "util/doc_api.h"
 #include "util/doc_tools.h"
+#include "util/front_matter.h"
+#include "util/input_history.h"
 #include "util/led_state.h"
 #include "util/tool_calls.h"
 #include "util/tool_registry.h"
@@ -126,6 +128,15 @@ public:
     /// разряде должно попасть на экран тем же путём, что и остальные
     /// подсказки, а не отдельной строкой.
     void notice(const char* text);
+
+    /// Сохранить последний ответ модели в архив (Ctrl+S, Р-050).
+    ///
+    /// Нужно, потому что архив раньше наполнялся только тогда, когда модель
+    /// догадывалась позвать `write_doc`. Ответ понравился — клавиша, и он в
+    /// архиве с блоком «Источники:», если поиск был.
+    ///
+    /// @return true, если заметка записана
+    bool save_answer();
 
     /// Заполнить «модельную» половину индикации светодиодов клавиатуры.
     ///
@@ -272,6 +283,9 @@ private:
     // --- Клавиатура ---
     void handle_typing_key(const hw::KeyEvent& ev);
     void backspace();
+
+    /// Шаг по истории ввода: +1 — вверх (старше), -1 — вниз (новее).
+    void history_step(int direction);
 
     // --- Отрисовка (каждая функция чистит свою область) ---
     void draw_all();
@@ -501,6 +515,11 @@ private:
     static constexpr size_t kInputCap = 2048;
     char _input[kInputCap]{};
     size_t _input_len{0};
+
+    /// История введённых вопросов (Alt+↑ / Alt+↓). Арена — в PSRAM: двадцать
+    /// слотов по 2 КБ плюс черновик, 42 КБ во внутренней RAM не найти.
+    inputhist::History _hist{};
+    char* _hist_arena{nullptr};
 
     Answer _answer;
 

@@ -128,6 +128,24 @@ Kind parse(const char* line, size_t len, const char** out_text, size_t* out_len)
     // продолжается без человека у платы.
     if (starts_with_ci(s, n, "new") && (n == 3 || is_space(s[3]))) return Kind::NewThread;
 
+    // `save` — сохранить последний ответ в архив. Тот же класс, что `new`:
+    // Ctrl+S есть, а скриптом его не нажать, и приёмка «ответ сохранён в
+    // архив» снова требовала бы человека у платы.
+    if (starts_with_ci(s, n, "save") && (n == 4 || is_space(s[4]))) return Kind::SaveAnswer;
+
+    // `dev <шаг>` — то же, что стрелка на экране параметров. Нужно потому, что
+    // яркость и пороги разряда иначе проверяются только руками, а прогон
+    // скриптом должен повторяться (Р-046).
+    if (starts_with_ci(s, n, "dev") && (n == 3 || is_space(s[3]))) {
+        size_t start = 3;
+        while (start < n && is_space(s[start]))
+            ++start;
+        if (start >= n) return Kind::Help;
+        if (out_text != nullptr) *out_text = s + start;
+        if (out_len != nullptr) *out_len = n - start;
+        return Kind::DevStep;
+    }
+
     // `screen <имя>` — открыть экран без клавиатуры. Приёмочные прогоны идут
     // скриптом по Serial (`ask`, `wifi off`, `api`), а экран «О программе» или
     // меню глазами проверяются нажатием клавиши, которого в скрипте нет.
@@ -176,8 +194,10 @@ const char* help_text()
            "\"thread\" — распечатать тред; \"wifi off\"/\"wifi on\" — выключить и включить сеть; "
            "\"api <адрес>\" — подменить адрес API (проверка на своём сервере); "
            "\"tz <зона>\" — сменить таймзону, формат POSIX: \"tz YEKT-5\"; "
-           "\"screen <имя>\" — открыть экран: chat, threads, notes, wifi, api, help, diag, about; "
+           "\"screen <имя>\" — открыть экран: chat, threads, notes, wifi, api, help, diag, about, settings; "
+           "\"dev <шаг>\" — шаг параметра: bright+1, timeout-1, layout, warn+1, crit-1, shut+1, tz+1, save; "
            "\"new\" — начать новый тред (то же, что Ctrl+N); "
+           "\"save\" — сохранить последний ответ в архив (то же, что Ctrl+S); "
            "\"help\" — эта подсказка";
 }
 
@@ -195,6 +215,7 @@ Screen parse_screen(const char* name, size_t len)
     if (word_is(name, len, "help") || word_is(name, len, "меню")) return Screen::Help;
     if (word_is(name, len, "diag") || word_is(name, len, "диагностика")) return Screen::Diag;
     if (word_is(name, len, "about") || word_is(name, len, "о-программе")) return Screen::About;
+    if (word_is(name, len, "settings") || word_is(name, len, "параметры")) return Screen::Settings;
     return Screen::None;
 }
 

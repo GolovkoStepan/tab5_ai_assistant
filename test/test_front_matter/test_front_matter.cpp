@@ -434,6 +434,88 @@ void test_escape_trailing_colon_is_quoted()
     TEST_ASSERT_EQUAL_STRING("\"итог:\"", out);
 }
 
+// --- Заголовок из тела (Р-050) ----------------------------------------------
+
+void test_title_from_body_first_line()
+{
+    char out[128];
+    const char* body = "Как достать фильтр из пылесоса\n\nПодробности далее.\n";
+    const size_t n = doc::title_from_body(body, strlen(body), out, sizeof(out));
+    TEST_ASSERT_EQUAL_UINT(strlen("Как достать фильтр из пылесоса"), n);
+    TEST_ASSERT_EQUAL_STRING("Как достать фильтр из пылесоса", out);
+}
+
+void test_title_from_body_skips_leading_blanks()
+{
+    char out[128];
+    // Тело после фронтматтера часто начинается с пустой строки.
+    const char* body = "\n   \n\t\nСброс ошибки\r\nдальше текст\n";
+    const size_t n = doc::title_from_body(body, strlen(body), out, sizeof(out));
+    TEST_ASSERT_EQUAL_UINT(strlen("Сброс ошибки"), n);
+    // \r в заголовок попасть не должен: он ломает фронтматтер.
+    TEST_ASSERT_EQUAL_STRING("Сброс ошибки", out);
+}
+
+void test_title_from_body_strips_markup()
+{
+    char out[128];
+
+    // Заголовок markdown: в списке нужно название, а не «# Название».
+    TEST_ASSERT_TRUE(doc::title_from_body("# Замена фильтра\n", 0, out, sizeof(out)) > 0);
+    TEST_ASSERT_EQUAL_STRING("Замена фильтра", out);
+
+    // Маркер списка — тоже не часть названия.
+    TEST_ASSERT_TRUE(doc::title_from_body("- Почистить щёткой\n", 0, out, sizeof(out)) > 0);
+    TEST_ASSERT_EQUAL_STRING("Почистить щёткой", out);
+
+    // А решётка без пробела — часть текста: «#1 способ» это не заголовок.
+    TEST_ASSERT_TRUE(doc::title_from_body("#1 способ\n", 0, out, sizeof(out)) > 0);
+    TEST_ASSERT_EQUAL_STRING("#1 способ", out);
+}
+
+void test_title_from_body_empty_gives_nothing()
+{
+    char out[128];
+    TEST_ASSERT_EQUAL_UINT(0, doc::title_from_body("", 0, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("", out);
+    TEST_ASSERT_EQUAL_UINT(0, doc::title_from_body("\n \n\t\n", 0, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_UINT(0, doc::title_from_body(nullptr, 0, out, sizeof(out)));
+    // Одна разметка без текста — тоже не заголовок.
+    TEST_ASSERT_EQUAL_UINT(0, doc::title_from_body("#\n", 0, out, sizeof(out)));
+}
+
+void test_title_from_body_truncates_on_utf8_boundary()
+{
+    // «Ж» — 2 байта. Буфер на 6 байт: под текст с многоточием остаётся 2 байта,
+    // то есть один целый символ. Обрезка взяла бы полтора — и в списке был бы
+    // мусорный глиф вместо буквы.
+    char small[6];
+    const char* body = "ЖЖЖЖЖЖЖЖ\n";
+    const size_t n = doc::title_from_body(body, strlen(body), small, sizeof(small));
+    TEST_ASSERT_EQUAL_UINT(5, n);  // «Ж» (2) + «…» (3)
+    TEST_ASSERT_EQUAL_MEMORY("Ж…", small, 5);
+    TEST_ASSERT_EQUAL_CHAR('\0', small[5]);
+}
+
+void test_title_from_body_truncates_at_word_boundary()
+{
+    // Длинный заголовок обрезается по границе слова и получает многоточие:
+    // обрубок «...связь и» читается как настоящий конец названия.
+    char out[32];
+    const char* body = "Привет. Вижу, что вы пишете одно и то же — возможно\n";
+    const size_t n = doc::title_from_body(body, strlen(body), out, sizeof(out));
+
+    TEST_ASSERT_TRUE(n > 0);
+    TEST_ASSERT_TRUE(n + 1 <= sizeof(out));
+    // Заканчивается многоточием, а не союзом или половиной буквы.
+    TEST_ASSERT_NOT_NULL(strstr(out, "…"));
+    TEST_ASSERT_EQUAL_CHAR('\0', out[n]);
+    // Последний символ перед многоточием — не пробел и не запятая.
+    const size_t before = n - 3;
+    TEST_ASSERT_TRUE(before > 0);
+    TEST_ASSERT_TRUE(out[before - 1] != ' ' && out[before - 1] != ',');
+}
+
 int main(int, char**)
 {
     UNITY_BEGIN();
@@ -472,6 +554,13 @@ int main(int, char**)
     RUN_TEST(test_escape_iso_time_stays_plain);
     RUN_TEST(test_escape_column_in_middle_is_quoted);
     RUN_TEST(test_escape_trailing_colon_is_quoted);
+
+    RUN_TEST(test_title_from_body_first_line);
+    RUN_TEST(test_title_from_body_skips_leading_blanks);
+    RUN_TEST(test_title_from_body_strips_markup);
+    RUN_TEST(test_title_from_body_empty_gives_nothing);
+    RUN_TEST(test_title_from_body_truncates_on_utf8_boundary);
+    RUN_TEST(test_title_from_body_truncates_at_word_boundary);
 
     return UNITY_END();
 }

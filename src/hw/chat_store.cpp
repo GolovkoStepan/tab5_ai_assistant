@@ -32,6 +32,7 @@
 #include "app_config.h"
 #include "hw/clock.h"
 #include "util/chat_list.h"
+#include "util/doc_search.h"
 
 namespace hw {
 namespace {
@@ -364,19 +365,43 @@ bool ChatStore::load_latest()
 
 size_t ChatStore::list_threads(ThreadInfo* out, size_t cap)
 {
+    return list_threads_from(0, nullptr, out, cap);
+}
+
+size_t ChatStore::list_threads_from(size_t skip, const char* query, ThreadInfo* out, size_t cap)
+{
+    _total_found = 0;
     if (!_ready || out == nullptr || cap == 0) return 0;
     if (cap > kMaxListedThreads) cap = kMaxListedThreads;
 
+    const bool filter = query != nullptr && query[0] != '\0';
+    const size_t qlen = filter ? strlen(query) : 0;
+
     File dir = SD_MMC.open(cfg::kChatsDir);
-    if (!dir || !dir.isDirectory()) return 0;
+    if (!dir || !dir.isDirectory()) {
+        if (dir) dir.close();
+        return 0;
+    }
 
     // Первый проход — имена и размеры, без чтения файлов. Имена тредов
     // начинаются с даты, поэтому лексикографически наибольшее имя — самое
-    // свежее. Заполняем out[] сразу: каталог отдаёт файлы в произвольном
-    // порядке, и останавливаться на первых cap нельзя — в список могли бы не
-    // попасть последние разговоры. Поэтому массив всегда отсортирован по
-    // убыванию, а всё, что старше последнего элемента, отбрасывается.
-    size_t found = 0;
+    // свежее. Массив держим отсортированным по убыванию и помним не больше
+    // kMaxScannedThreads: всё, что старше, отбрасывается, но это уже не
+    // «молча» — об отбрасывании говорит счётчик.
+    //
+    // Компактная запись, а не ThreadInfo: 240 полных записей с заголовками —
+    // это 40 КБ, а нужны здесь только имя и размер.
+    struct SlugEntry {
+        char slug[48];
+        size_t bytes;
+    };
+    SlugEntry* all = static_cast<SlugEntry*>(static_cast<void*>(alloc_psram(kMaxScannedThreads * sizeof(SlugEntry))));
+    if (all == nullptr) {
+        dir.close();
+        return 0;
+    }
+
+    size_t stored = 0;
 
     for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
         if (entry.isDirectory()) {
@@ -407,36 +432,49 @@ size_t ChatStore::list_threads(ThreadInfo* out, size_t cap)
 
         if (!valid_slug(slug)) continue;
 
-        // Место в отсортированном массиве. Дёшево: записей не больше сорока, и
-        // происходит это только при входе на экран.
+        // Место в отсортированном массиве. Дёшево: сравнений не больше числа
+        // сохранённых записей, и происходит это только при входе на экран.
         size_t pos = 0;
-        while (pos < found && strcmp(out[pos].slug, slug) > 0)
+        while (pos < stored && strcmp(all[pos].slug, slug) > 0)
             ++pos;
-        if (pos >= cap) continue;  // старше всех, что помещаются
+        if (pos >= kMaxScannedThreads) continue;  // старше всех, что помним
 
-        const size_t last = found < cap ? found : cap - 1;
+        const size_t last = stored < kMaxScannedThreads ? stored : kMaxScannedThreads - 1;
         for (size_t i = last; i > pos; --i)
-            out[i] = out[i - 1];
-        out[pos] = ThreadInfo{};
-        snprintf(out[pos].slug, sizeof(out[pos].slug), "%s", slug);
-        out[pos].bytes = size;
-        if (found < cap) ++found;
+            all[i] = all[i - 1];
+        snprintf(all[pos].slug, sizeof(all[pos].slug), "%s", slug);
+        all[pos].bytes = size;
+        if (stored < kMaxScannedThreads) ++stored;
     }
     dir.close();
 
-    if (found == 0) return 0;
+    if (stored == 0) {
+        free(all);
+        return 0;
+    }
+
+    // Без поиска «всего» известно уже сейчас: это число файлов тредов. Читать
+    // двести заголовков ради счётчика, который и так есть, незачем.
+    if (!filter) _total_found = stored;
 
     // Второй проход — даты и заголовки. Буфер строки один на весь проход:
-    // 16 КБ не помещаются на стеке задачи цикла, а выделять его на каждый тред
+    // 40 КБ не помещаются на стеке задачи цикла, а выделять его на каждый тред
     // незачем.
     char* line = static_cast<char*>(alloc_psram(kMaxLineBytes));
-    if (line == nullptr) return 0;
+    if (line == nullptr) {
+        free(all);
+        return 0;
+    }
 
-    for (size_t i = 0; i < found; ++i) {
-        ThreadInfo& info = out[i];
+    size_t matched = 0;  // сколько тредов подошло под запрос (или всего)
+    size_t filled = 0;
+
+    for (size_t i = 0; i < stored; ++i) {
+        ThreadInfo info;
+        info.bytes = all[i].bytes;
 
         chatlist::Stamp stamp;
-        if (chatlist::parse_slug(info.slug, stamp)) {
+        if (chatlist::parse_slug(all[i].slug, stamp)) {
             info.year = stamp.year;
             info.month = stamp.month;
             info.day = stamp.day;
@@ -445,32 +483,60 @@ size_t ChatStore::list_threads(ThreadInfo* out, size_t cap)
             info.time_known = stamp.real;
         }
 
-        // У пустого треда заголовка нет по определению.
-        if (info.bytes == 0) continue;
-
-        char path[96];
-        make_path(info.slug, path, sizeof(path));
-        File f = SD_MMC.open(path, FILE_READ);
-        if (!f) continue;
-
-        // Читаем построчно, но не больше нескольких строк: первая строка может
-        // оказаться ответом модели или мусором, а вопрос пользователя —
-        // следующей.
-        for (int attempt = 0; attempt < 4; ++attempt) {
-            int n = f.readBytesUntil('\n', line, kMaxLineBytes - 1);
-            if (n <= 0) break;
-            line[n] = '\0';
-            // Хвостовой '\r' от CRLF-файла.
-            while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == '\n'))
-                line[--n] = '\0';
-            if (n == 0) continue;
-            if (chatlist::title_from_line(line, static_cast<size_t>(n), info.title, sizeof(info.title))) break;
+        // Заголовок нужен и для показа, и для поиска. Без поиска читаем только
+        // те треды, что попадут на страницу: остальные заголовки никому не
+        // нужны, а каждое открытие файла — это обращение к SD.
+        const bool needed = filter || (matched >= skip && filled < cap);
+        if (!needed) {
+            ++matched;
+            continue;
         }
-        f.close();
+
+        if (info.bytes > 0) {
+            char path[96];
+            make_path(all[i].slug, path, sizeof(path));
+            File f = SD_MMC.open(path, FILE_READ);
+            if (f) {
+                // Читаем построчно, но не больше нескольких строк: первая строка
+                // может оказаться ответом модели или мусором, а вопрос
+                // пользователя — следующей.
+                for (int attempt = 0; attempt < 4; ++attempt) {
+                    int n = f.readBytesUntil('\n', line, kMaxLineBytes - 1);
+                    if (n <= 0) break;
+                    line[n] = '\0';
+                    // Хвостовой '\r' от CRLF-файла.
+                    while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == '\n'))
+                        line[--n] = '\0';
+                    if (n == 0) continue;
+                    if (chatlist::title_from_line(line, static_cast<size_t>(n), info.title, sizeof(info.title))) break;
+                }
+                f.close();
+            }
+        }
+
+        if (filter) {
+            // Ищем в заголовке и в имени: имя — это дата, по ней тоже ищут
+            // («что было вчера» набирают как «20261126»).
+            const bool hit = docsearch::find_ci(info.title, strlen(info.title), query, qlen) != nullptr ||
+                             docsearch::find_ci(all[i].slug, strlen(all[i].slug), query, qlen) != nullptr;
+            if (!hit) continue;
+        }
+
+        ++matched;
+        if (matched <= skip) continue;
+        if (filled >= cap) continue;
+
+        snprintf(info.slug, sizeof(info.slug), "%s", all[i].slug);
+        out[filled++] = info;
     }
 
     free(line);
-    return found;
+    free(all);
+
+    // С поиском «всего» становится известно только теперь — оно и есть число
+    // совпадений.
+    if (filter) _total_found = matched;
+    return filled;
 }
 
 bool ChatStore::build_line(const ChatMessage& msg, char* out, size_t out_len)

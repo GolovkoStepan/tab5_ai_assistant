@@ -329,6 +329,18 @@ void ChatScreen::init(
     if (_search_text == nullptr) _search_text = static_cast<char*>(malloc(kSearchTextCap));
     if (_search_text != nullptr) _search_text[0] = '\0';
 
+    // История введённых вопросов (Alt+↑/↓). Арена в PSRAM: 21 слот по 2 КБ.
+    // Не выделилась — история просто не работает; чат от этого страдать не
+    // должен, поэтому отказ здесь не ошибка, а запись в журнал на месте add().
+    _hist_arena = static_cast<char*>(heap_caps_malloc(inputhist::kArenaBytes, MALLOC_CAP_SPIRAM));
+    if (_hist_arena == nullptr) _hist_arena = static_cast<char*>(malloc(inputhist::kArenaBytes));
+    if (!inputhist::init(_hist, _hist_arena, inputhist::kArenaBytes)) _hist_arena = nullptr;
+
+    // Слот истории вмещает ровно то, что влезает в поле ввода: иначе длинный
+    // вопрос молча не запоминался бы, а человек не понял бы, почему Alt+↑ его
+    // не вернул.
+    static_assert(inputhist::kEntryCap == kInputCap, "слот истории должен совпадать с буфером ввода");
+
     doctools::register_all(_tools);
     wsearch::register_tool(_tools);
     if (_tools_json != nullptr) {
@@ -482,6 +494,9 @@ void ChatScreen::reset_after_thread_change()
     _scroll = 0;
     _input[0] = '\0';
     _input_len = 0;
+    // История ввода — про этот разговор, а не про устройство: в новом треде
+    // повторять вопросы прошлого предлагать нечего.
+    inputhist::clear(_hist);
     invalidate_measure();
     _feed_valid = false;
     _redraw_all = true;
@@ -599,8 +614,19 @@ bool ChatScreen::onKey(const hw::KeyEvent& ev)
         return false;
     }
 
-    // Ctrl+R — очистка открытого треда. «к» — та же клавиша в ЙЦУКЕН.
-    //
+    // Ctrl+S — сохранить последний ответ в архив (Р-050). «ы» — та же клавиша
+    // в ЙЦУКЕН. Работает только в покое: сохранять недописанный ответ значит
+    // положить в архив половину.
+    if (ev.ctrl && is_char(ev) && (strcmp(ev.utf8, "s") == 0 || strcmp(ev.utf8, "ы") == 0)) {
+        if (_mode != Mode::Idle) {
+            notice("Дождитесь ответа: сохранить можно готовый ответ");
+            return false;
+        }
+        save_answer();
+        return false;
+    }
+
+    // Ctrl+R — очистка открытого треда. «к» — та же клавиша в ЙЦУКЕН.    //
     // Сброс необратим, поэтому первое нажатие только спрашивает, второе —
     // чистит.
     if (ev.ctrl && is_char(ev) && (strcmp(ev.utf8, "r") == 0 || strcmp(ev.utf8, "к") == 0)) {
@@ -710,6 +736,9 @@ bool ChatScreen::onKey(const hw::KeyEvent& ev)
                 _input[0] = '\0';
                 _input_len = 0;
                 _redraw_input = true;
+                // Поле пусто — листание истории начинается заново с самой
+                // свежей записи, а не продолжает с прежнего места.
+                inputhist::to_draft(_hist);
             }
             return false;
 
@@ -727,6 +756,14 @@ bool ChatScreen::onKey(const hw::KeyEvent& ev)
             return false;
 
         case keymap::Special::Up: {
+            // Alt+↑ — история введённых вопросов, а не прокрутка ленты. Без
+            // модификатора стрелка листает ленту: прокрутка нужна чаще, чем
+            // повтор вопроса, и отнимать её нельзя.
+            if (ev.alt) {
+                history_step(+1);
+                return false;
+            }
+
             const size_t total = total_lines();
             const size_t page = visible_lines();
             const size_t max_scroll = total > page ? total - page : 0;
@@ -745,6 +782,12 @@ bool ChatScreen::onKey(const hw::KeyEvent& ev)
         }
 
         case keymap::Special::Down: {
+            // Alt+↓ — обратно к более новым вопросам и к черновику.
+            if (ev.alt) {
+                history_step(-1);
+                return false;
+            }
+
             const size_t was = _scroll;
             if (ev.ctrl) {
                 _scroll = 0;
@@ -762,6 +805,7 @@ bool ChatScreen::onKey(const hw::KeyEvent& ev)
                 _input[0] = '\0';
                 _input_len = 0;
                 _redraw_input = true;
+                inputhist::to_draft(_hist);
             }
             return false;
 
@@ -807,6 +851,30 @@ void ChatScreen::backspace()
     } while (_input_len > 0 && (static_cast<unsigned char>(_input[_input_len]) & 0xC0) == 0x80);
 
     _input[_input_len] = '\0';
+    _redraw_input = true;
+}
+
+void ChatScreen::history_step(int direction)
+{
+    if (_hist.arena == nullptr) {
+        // Арены не было — история не работает. Сказать об этом один раз честнее,
+        // чем молча не реагировать на Alt+↑: человек решил бы, что клавиша
+        // сломалась.
+        notice("История ввода недоступна: не хватило памяти");
+        return;
+    }
+
+    size_t len = 0;
+    const char* text = direction > 0 ? inputhist::up(_hist, _input, _input_len, &len) : inputhist::down(_hist, &len);
+
+    // nullptr означает «дальше некуда»: на границе истории поле не трогаем,
+    // иначе Alt+↑ затирал бы то, что человек видит, пустотой.
+    if (text == nullptr) return;
+    if (len >= sizeof(_input)) return;
+
+    memcpy(_input, text, len);
+    _input[len] = '\0';
+    _input_len = len;
     _redraw_input = true;
 }
 
@@ -898,6 +966,11 @@ bool ChatScreen::send_question()
         fail(err);
         return false;
     }
+
+    // Вопрос ушёл в файл — запоминаем его в истории ввода. Только после
+    // успешной записи: вопрос, который не отправился, повторять из истории
+    // незачем, а поле он покидает лишь теперь.
+    inputhist::add(_hist, _input, _input_len);
 
     // Вопрос ушёл в файл — очищаем поле только после успешной записи: иначе
     // при ошибке SD пользователь потерял бы набранный текст.
@@ -1214,6 +1287,80 @@ void ChatScreen::append_web_sources()
         static_cast<unsigned>(_store->count() > 0 ? _store->last()->content_len : 0));
 
     if (len > 0 && append_answer(text, len) && _scroll == 0) _redraw_feed = true;
+}
+
+bool ChatScreen::save_answer()
+{
+    if (_docs == nullptr || _settings == nullptr || _store == nullptr) return false;
+
+    // Берём последнее сообщение модели с текстом. Искать «последнее вообще»
+    // нельзя: после ответа мог прийти результат инструмента, и сохранился бы
+    // он, а не ответ.
+    const hw::ChatMessage* answer = nullptr;
+    for (size_t i = _store->count(); i > 0; --i) {
+        const hw::ChatMessage& m = _store->at(i - 1);
+        if (m.role == api::Role::Assistant && m.content != nullptr && m.content_len > 0) {
+            answer = &m;
+            break;
+        }
+    }
+    if (answer == nullptr) {
+        notice("Сохранять нечего: ответа в треде нет");
+        return false;
+    }
+
+    char ts[32];
+    if (!hw::clock_sync::now_iso(_settings->config(), ts, sizeof(ts))) {
+        fail("Часы не выставлены: заметку не назвать. Ctrl+W — сеть для NTP");
+        return false;
+    }
+
+    char rel[paths::kMaxPathLen];
+    if (!paths::inbox_path(ts, "answer", rel, sizeof(rel))) {
+        fail("Не удалось собрать имя заметки: проверьте время в настройках");
+        return false;
+    }
+    // Имя построено по секундам: две заметки подряд могли бы совпасть, и вторая
+    // молча затёрла бы первую.
+    if (_docs->exists(rel)) {
+        fail("Файл с таким временем уже есть — повторите через секунду");
+        return false;
+    }
+
+    doc::Meta meta;
+    if (doc::title_from_body(answer->content, answer->content_len, meta.title, sizeof(meta.title)) == 0) {
+        // Ответ из одной разметки — названия нет. Подставляем дату.
+        snprintf(meta.title, sizeof(meta.title), "Ответ %.10s %.5s", ts, ts + 11);
+    }
+    snprintf(meta.created, sizeof(meta.created), "%s", ts);
+    snprintf(meta.updated, sizeof(meta.updated), "%s", ts);
+
+    // Источник заметки — первый найденный в этом ходе. Так же поступает
+    // write_doc, когда модель не передала свой (см. doc_tools): блок
+    // «Источники:» в теле остаётся полным, а поле связывает заметку с главной
+    // страницей.
+    if (_web_sources != nullptr && _web_sources->count > 0) {
+        snprintf(meta.source_url, sizeof(meta.source_url), "%s", _web_sources->items[0].url);
+    }
+
+    bool created = false;
+    char err[200];
+    if (!_docs->write(rel, meta, answer->content, &created, err, sizeof(err))) {
+        fail(err[0] != '\0' ? err : "Не удалось сохранить ответ в архив");
+        return false;
+    }
+
+    char idx_err[96];
+    if (!_docs->rebuild_index(idx_err, sizeof(idx_err))) {
+        Serial.printf("Чат: индекс не пересобрался — %s\n", idx_err);
+    }
+
+    // В полосе — имя файла без папки: по нему заметку легко найти в списке, а
+    // полный путь в 160 байт не влез бы.
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Ответ сохранён в архив: %s", rel + 6);
+    notice(msg);
+    return true;
 }
 
 // --- Агентский цикл ---------------------------------------------------------
@@ -2743,8 +2890,8 @@ void ChatScreen::draw_hints()
         ui::text("Удаление необратимо · Enter — удалить · Esc — отмена", kMarginX, ui::kHintY, kColorPartial);
         return;
     }
-    ui::text("Enter — отправить · Esc — прервать или очистить · ↑↓ — прокрутка · Ctrl+M — меню", kMarginX, ui::kHintY,
-        kColorFaint);
+    ui::text("Enter — отправить · ↑↓ — прокрутка · Alt+↑↓ — история · Ctrl+S — в архив · Ctrl+M — меню", kMarginX,
+        ui::kHintY, kColorFaint);
 }
 
 }  // namespace ui

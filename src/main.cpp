@@ -30,6 +30,7 @@
 #include "ui/about_screen.h"
 #include "ui/api_settings_screen.h"
 #include "ui/chat_screen.h"
+#include "ui/device_settings_screen.h"
 #include "ui/draw.h"
 #include "ui/help_screen.h"
 #include "ui/notes_screen.h"
@@ -39,6 +40,7 @@
 #include "ui/wifi_screen.h"
 #include "util/about_info.h"
 #include "util/backlight.h"
+#include "util/device_settings.h"
 #include "util/format.h"
 #include "util/power_guard.h"
 #include "util/serial_cmd.h"
@@ -54,6 +56,7 @@ hw::DocStore g_doc_store;
 ui::WifiScreen g_wifi_screen;
 ui::ChatScreen g_chat_screen;
 ui::ApiSettingsScreen g_api_screen;
+ui::DeviceSettingsScreen g_device_screen;
 ui::ThreadsScreen g_threads_screen;
 ui::NotesScreen g_notes_screen;
 ui::HelpScreen g_help_screen;
@@ -71,6 +74,7 @@ enum class Screen : uint8_t {
     Notes,
     Wifi,
     ApiSettings,
+    DeviceSettings,
     Help,
     About,
 };
@@ -567,6 +571,11 @@ namespace {
 /// секунду не показывать пустые строки.
 ui::AboutScreen::Info build_about_info();
 
+/// Применить параметры устройства к железу. Объявлено до switch_screen:
+/// выход с экрана «Параметры» без сохранения зовёт её же, чтобы вернуть
+/// яркость и раскладку к тому, что лежит в файле.
+void apply_device_settings();
+
 /// Переключить экран. Сначала выгружаем текущий, потом входим в новый: у
 /// каждого экрана есть onExit, и пропустить его значит оставить недописанное
 /// или нестёртый пароль.
@@ -580,6 +589,25 @@ void switch_screen(Screen next)
     case Screen::Notes: g_notes_screen.onExit(); break;
     case Screen::Wifi: g_wifi_screen.onExit(); break;
     case Screen::ApiSettings: g_api_screen.onExit(); break;
+    // Выход из параметров без сохранения возвращает прежнюю яркость: она
+    // применялась сразу, иначе правка была бы невидимой.
+    case Screen::DeviceSettings: {
+        // Правки не сохранены — предупреждаем ДО onExit(): после него черновик
+        // уже равен файлу, и признать потерю будет не по чему. Экран при этом
+        // закрывается: спрашивать подтверждение стрелками неудобно, а Esc
+        // здесь и так значит «выйти». Молча терять правку хуже, чем сказать.
+        const bool lost = g_device_screen.unsaved();
+        g_device_screen.onExit();
+        if (lost) {
+            g_chat_screen.notice("Параметры не сохранены — Ctrl+G, затем Ctrl+S");
+        }
+        // Яркость и раскладка применялись сразу, чтобы правка была видна:
+        // иначе «убавить яркость» было бы невидимым действием, а экран
+        // продолжал бы слепить. onExit() вернул черновик к сохранённым
+        // значениям, и apply_device_settings() берёт именно его — то есть файл.
+        apply_device_settings();
+        break;
+    }
     case Screen::Help: break;
     case Screen::Diagnostic: break;
     case Screen::About: break;
@@ -593,6 +621,7 @@ void switch_screen(Screen next)
     case Screen::Notes: g_notes_screen.onEnter(); break;
     case Screen::Wifi: g_wifi_screen.onEnter(); break;
     case Screen::ApiSettings: g_api_screen.onEnter(); break;
+    case Screen::DeviceSettings: g_device_screen.onEnter(); break;
     // Помощь возвращает туда, откуда её открыли: Esc из меню, открытого в
     // архиве, должен вернуть в архив, а не в чат. Это делает main, а не экран:
     // экран не знает, кто его позвал.
@@ -713,6 +742,33 @@ uint8_t backlight_brightness()
 void apply_backlight()
 {
     M5.Display.setBrightness(backlight_brightness());
+}
+
+/// Применить к железу сохранённые (или только что изменённые) параметры
+/// устройства.
+///
+/// Нужна, потому что экран «Параметры» правит только файл: яркость живёт в
+/// подсветке, раскладка — в клавиатуре, таймзона — в часах. Вызывается после
+/// Ctrl+S на экране и после смены значения, которое должно быть видно сразу
+/// (яркость, раскладка, пояс).
+void apply_device_settings()
+{
+    // Берём ЧЕРНОВИК экрана, если экран открыт: яркость и раскладка
+    // применяются сразу, чтобы правка была видна, а в файл уйдут только по
+    // Ctrl+S. После выхода с экрана берём файл — onExit уже сбросил черновик.
+    const settings::Config& c = g_screen == Screen::DeviceSettings ? g_device_screen.draft() : g_settings.config();
+
+    // Яркость — через общее правило (0 в настройках означает «всегда темно»,
+    // а не «не гасить»), а не сырым значением: одно правило на весь код.
+    M5.Display.setBrightness(backlight::brightness(c.brightness, g_backlight_on));
+    g_keyboard.setLayout(c.layout_russian ? keymap::Layout::Russian : keymap::Layout::Latin);
+    hw::clock_sync::begin(c);
+
+    // В журнал — счётом, а не глазами: приёмка «стрелка яркости сработала»
+    // иначе требует человека у платы (Р-046).
+    logLine("Параметры: яркость %u, раскладка %s, таймаут %u мин, пояс %s, пороги %u/%u/%u", c.brightness,
+        c.layout_russian ? "ЙЦУКЕН" : "латиница", c.screen_timeout_min, c.timezone, c.battery_warn_percent,
+        c.battery_critical_percent, c.battery_shutdown_percent);
 }
 
 void mark_activity()
@@ -1195,6 +1251,7 @@ void setup()
 
     g_chat_screen.init(g_api, g_chat_store, g_settings, g_wifi, g_doc_store);
     g_api_screen.init(g_settings, g_wifi);
+    g_device_screen.init(g_settings);
     g_threads_screen.init(g_chat_store);
     // Экран заметок получает ссылку на хранилище всегда, даже если архив не
     // поднялся: ready() проверяется внутри, и экран покажет причину, а не
@@ -1344,6 +1401,10 @@ void poll_serial_command()
                         Serial.printf("Serial: таймзона не принята — %s\n", err);
                         break;
                     }
+                    // Экран параметров держит черновик: без синхронизации
+                    // Ctrl+S вернул бы прежний пояс.
+                    if (g_screen == Screen::DeviceSettings) g_device_screen.sync_timezone(tz);
+
                     // TZ применяется сразу: часы в трее и метки в треде начнут
                     // считаться по новому поясу без перезагрузки. NTP уже сверен,
                     // системные часы хранят UTC — пересчёт делает localtime_r.
@@ -1361,6 +1422,38 @@ void poll_serial_command()
                         break;
                     }
                     g_chat_screen.new_thread();
+                    break;
+                }
+                case serialcmd::Kind::SaveAnswer: {
+                    // То же, что Ctrl+S в чате. Скриптом клавишу не нажать, а
+                    // приёмка «ответ сохранён в архив» иначе ждёт человека.
+                    if (g_chat_screen.busy()) {
+                        Serial.println("Serial: идёт ход — сохранять нечего, дождитесь ответа");
+                        break;
+                    }
+                    Serial.println(
+                        g_chat_screen.save_answer() ? "Serial: ответ сохранён в архив" : "Serial: ответ не сохранён");
+                    break;
+                }
+                case serialcmd::Kind::DevStep: {
+                    // То же, что стрелка на экране параметров: приёмка яркости и
+                    // порогов разряда иначе требует человека у клавиатуры.
+                    if (g_screen != Screen::DeviceSettings) {
+                        Serial.println("Serial: сначала откройте экран параметров: screen settings");
+                        break;
+                    }
+                    const devsettings::Step step = devsettings::parse_step(text, text_len);
+                    if (step.param == devsettings::Param::None) {
+                        Serial.println(
+                            "Serial: шаг не распознан. Примеры: bright+1, timeout-1, layout, warn+1, tz+1, save");
+                        break;
+                    }
+                    if (g_device_screen.apply_step(step.param, step.delta)) {
+                        Serial.println("Serial: шаг принят");
+                    } else {
+                        Serial.println("Serial: шаг не изменил значение (граница или порядок порогов)");
+                    }
+                    if (g_device_screen.take_applied()) apply_device_settings();
                     break;
                 }
                 case serialcmd::Kind::Screen: {
@@ -1409,6 +1502,7 @@ void poll_serial_command()
                         if (g_screen != Screen::About) g_about_return = g_screen;
                         switch_screen(Screen::About);
                         break;
+                    case serialcmd::Screen::Settings: switch_screen(Screen::DeviceSettings); break;
                     case serialcmd::Screen::None: break;
                     }
                     Serial.printf("Serial: экран %s открыт\n", name);
@@ -1459,7 +1553,13 @@ void loop()
         // латиница, хотя выбор пользователя должен жить дольше сеанса.
         if (ev.special == keymap::Special::LayoutToggle) {
             char err[96];
-            g_settings.set_layout_russian(g_keyboard.layout() == keymap::Layout::Russian, err, sizeof(err));
+            const bool russian = g_keyboard.layout() == keymap::Layout::Russian;
+            g_settings.set_layout_russian(russian, err, sizeof(err));
+
+            // Экран параметров держит черновик: без синхронизации Ctrl+S
+            // вернул бы прежнюю раскладку, и только что сделанное
+            // переключение пропало бы молча.
+            if (g_screen == Screen::DeviceSettings) g_device_screen.sync_layout(russian);
 
             if (g_screen == Screen::Diagnostic) {
                 g_seen[ev.row * keymap::kCols + ev.col] = true;
@@ -1491,7 +1591,8 @@ void loop()
                              strcmp(ev.utf8, "ф") == 0 || strcmp(ev.utf8, "t") == 0 || strcmp(ev.utf8, "е") == 0 ||
                              strcmp(ev.utf8, "o") == 0 || strcmp(ev.utf8, "щ") == 0 || strcmp(ev.utf8, "d") == 0 ||
                              strcmp(ev.utf8, "в") == 0 || strcmp(ev.utf8, "m") == 0 || strcmp(ev.utf8, "ь") == 0 ||
-                             strcmp(ev.utf8, "i") == 0 || strcmp(ev.utf8, "ш") == 0;
+                             strcmp(ev.utf8, "i") == 0 || strcmp(ev.utf8, "ш") == 0 || strcmp(ev.utf8, "g") == 0 ||
+                             strcmp(ev.utf8, "п") == 0;
             if (nav && g_screen == Screen::Notes && g_notes_screen.has_unsaved_edits()) {
                 g_notes_screen.notice("Есть несохранённые правки — Ctrl+S сохранить · Esc выйти");
                 continue;
@@ -1517,6 +1618,13 @@ void loop()
             }
             if (strcmp(ev.utf8, "d") == 0 || strcmp(ev.utf8, "в") == 0) {
                 switch_screen(g_screen == Screen::Diagnostic ? Screen::Chat : Screen::Diagnostic);
+                continue;
+            }
+            // Ctrl+G — параметры устройства (Р-049). «п» — та же клавиша в
+            // ЙЦУКЕН. Отдельный экран, а не поля в Ctrl+A: там семь строк про
+            // модель и ключ, и яркость среди них искали бы глазами.
+            if (strcmp(ev.utf8, "g") == 0 || strcmp(ev.utf8, "п") == 0) {
+                switch_screen(g_screen == Screen::DeviceSettings ? Screen::Chat : Screen::DeviceSettings);
                 continue;
             }
             // Ctrl+I — «О программе». «ш» — та же клавиша в ЙЦУКЕН.
@@ -1575,6 +1683,14 @@ void loop()
         }
         if (g_screen == Screen::ApiSettings) {
             if (g_api_screen.onKey(ev)) switch_screen(Screen::Chat);
+            continue;
+        }
+        if (g_screen == Screen::DeviceSettings) {
+            // Экран правит черновик, а применяет его main: яркость живёт в
+            // подсветке, раскладка — в клавиатуре, таймзона — в часах.
+            const bool want_close = g_device_screen.onKey(ev);
+            if (g_device_screen.take_applied()) apply_device_settings();
+            if (want_close) switch_screen(Screen::Chat);
             continue;
         }
         if (g_screen == Screen::Threads) {
@@ -1647,6 +1763,7 @@ void loop()
     g_wifi_screen.tick();
     g_chat_screen.tick();
     g_api_screen.tick();
+    g_device_screen.tick();
     hw::clock_sync::tick(g_wifi.connected());
     update_power();
     update_power_guard();
@@ -1727,6 +1844,14 @@ void loop()
         return;
     }
 
+    if (g_screen == Screen::DeviceSettings) {
+        if (td.wasReleased()) g_device_screen.onTouch(td.x, td.y);
+        if (g_device_screen.take_applied()) apply_device_settings();
+        if (g_device_screen.dirty()) g_device_screen.draw();
+        delay(10);
+        return;
+    }
+
     if (g_screen == Screen::Threads) {
         g_threads_screen.set_chat_busy(g_chat_screen.busy());
         if (td.wasReleased()) g_threads_screen.onTouch(td.x, td.y);
@@ -1766,6 +1891,7 @@ void loop()
             case ui::HelpScreen::Target::Threads: switch_screen(Screen::Threads); break;
             case ui::HelpScreen::Target::Notes: switch_screen(Screen::Notes); break;
             case ui::HelpScreen::Target::ApiSettings: switch_screen(Screen::ApiSettings); break;
+            case ui::HelpScreen::Target::DeviceSettings: switch_screen(Screen::DeviceSettings); break;
             case ui::HelpScreen::Target::Wifi: switch_screen(Screen::Wifi); break;
             case ui::HelpScreen::Target::Diagnostic: switch_screen(Screen::Diagnostic); break;
             case ui::HelpScreen::Target::About:

@@ -316,6 +316,118 @@ size_t escape_value(const char* value, char* out, size_t out_len)
     return n;
 }
 
+size_t title_from_body(const char* body, size_t len, char* out, size_t out_len)
+{
+    if (out == nullptr || out_len < 2) return 0;
+    out[0] = '\0';
+    if (body == nullptr) return 0;
+    if (len == 0) len = strlen(body);
+
+    // Ищем первую непустую строку. Пропускаем ровно пустые и «из пробелов»:
+    // тело, начатое с перевода строки, — обычное дело после фронтматтера.
+    size_t pos = 0;
+    while (pos < len) {
+        const size_t end = line_end(body, len, pos);
+        const char* line = body + pos;
+        size_t line_len = end - pos;
+
+        // Без \r: файл мог приехать с Windows, и заголовок с невидимым \r
+        // попал бы во фронтматтер, где ломает разбор.
+        if (line_len > 0 && line[line_len - 1] == '\r') --line_len;
+
+        // Пустая строка или одни пробелы — ищем дальше.
+        size_t first = 0;
+        while (first < line_len && (line[first] == ' ' || line[first] == '\t'))
+            ++first;
+        if (first == line_len) {
+            pos = end + 1;
+            continue;
+        }
+
+        // Снять ведущие пробелы.
+        line += first;
+        line_len -= first;
+
+        // Разметка начала строки. Заголовок «# Как сбросить» в списке читался
+        // бы как мусор: человек писал название, а не разметку.
+        size_t skip = 0;
+        while (skip < line_len && line[skip] == '#')
+            ++skip;
+        if (skip > 0) {
+            if (skip == line_len) {
+                // Строка из одних решёток — пустой заголовок markdown, а не
+                // название. Берём следующую строку.
+                pos = end + 1;
+                continue;
+            }
+            // После решёток по правилам markdown должен быть пробел; если его
+            // нет («#1 способ»), решётка — часть текста, не заголовок.
+            if (line[skip] == ' ' || line[skip] == '\t') {
+                line += skip;
+                line_len -= skip;
+                while (line_len > 0 && (*line == ' ' || *line == '\t')) {
+                    ++line;
+                    --line_len;
+                }
+            }
+        } else if (line_len >= 2 && (line[0] == '-' || line[0] == '*' || line[0] == '+') &&
+                   (line[1] == ' ' || line[1] == '\t')) {
+            line += 2;
+            line_len -= 2;
+            while (line_len > 0 && (*line == ' ' || *line == '\t')) {
+                ++line;
+                --line_len;
+            }
+        }
+
+        // Пробелы и приметы пункта справа.
+        while (line_len > 0 && (line[line_len - 1] == ' ' || line[line_len - 1] == '\t'))
+            --line_len;
+
+        if (line_len == 0) {
+            // Строка состояла из одной разметки — берём следующую.
+            pos = end + 1;
+            continue;
+        }
+
+        // Обрезка по границе UTF-8: продолжающие байты — 0b10xxxxxx. Иначе
+        // кириллический заголовок кончался бы половиной буквы.
+        size_t n = line_len;
+        bool truncated = false;
+        if (n + 1 > out_len) {
+            truncated = true;
+            // Оставляем место под «…» (3 байта): обрубок без многоточия
+            // читается как настоящий конец названия.
+            const size_t limit = out_len - 1 > 3 ? out_len - 1 - 3 : out_len - 1;
+            n = limit;
+            while (n > 0 && (static_cast<unsigned char>(line[n]) & 0xC0) == 0x80)
+                --n;
+            if (n == 0) {
+                // Один символ шире буфера — писать нечего.
+                return 0;
+            }
+            // Отступаем до границы слова: «...проверяете связь и» кончается
+            // союзом, и это выглядит как обрыв, а не как название.
+            size_t word = n;
+            while (word > 0 && line[word - 1] != ' ' && line[word - 1] != '\t' && word > n / 2)
+                --word;
+            if (word > 0 && word > n / 2) n = word;
+            while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == '\t' || line[n - 1] == ','))
+                --n;
+        }
+
+        memcpy(out, line, n);
+        if (truncated) {
+            memcpy(out + n, "…", 3);
+            n += 3;
+        }
+        out[n] = '\0';
+        return n;
+    }
+
+    return 0;
+}
+
 size_t build(const Meta& meta, const char* body, char* out, size_t out_len)
 {
     if (out == nullptr || out_len == 0) return 0;

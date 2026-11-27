@@ -306,4 +306,33 @@ bool SettingsStore::set_api_settings(const settings::Config& cfg, char* err, siz
     return true;
 }
 
+bool SettingsStore::set_device_settings(const settings::Config& cfg, char* err, size_t err_len)
+{
+    if (err && err_len > 0) err[0] = '\0';
+
+    char local_err[128];
+    if (!settings::validate(cfg, local_err, sizeof(local_err))) {
+        if (err && err_len > 0) snprintf(err, err_len, "%s", local_err);
+        return false;
+    }
+
+    // Поля API экран параметров не меняет: берём их из СВОИХ настроек, а не из
+    // черновика. Иначе сохранение яркости вернуло бы адрес API и модель к тем,
+    // что были при входе на экран.
+    settings::Config next = cfg;
+    snprintf(next.api_base_url, sizeof(next.api_base_url), "%s", _config.api_base_url);
+    snprintf(next.api_model, sizeof(next.api_model), "%s", _config.api_model);
+    next.temperature_tenths = _config.temperature_tenths;
+    next.reasoning_effort = _config.reasoning_effort;
+    next.search_enabled = _config.search_enabled;
+    next.search_max_results = _config.search_max_results;
+
+    // Сначала в память — иначе при отказе записи экран показывал бы сохранённое,
+    // а на карте осталось бы старое.
+    _config = next;
+
+    if (!save_to_file(err, err_len)) return false;
+    return true;
+}
+
 }  // namespace hw

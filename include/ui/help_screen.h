@@ -33,6 +33,7 @@ public:
         Threads,
         Notes,
         ApiSettings,
+        DeviceSettings,
         Wifi,
         Diagnostic,
         About,

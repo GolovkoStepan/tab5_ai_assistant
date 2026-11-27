@@ -13,12 +13,15 @@
 
 #include "ui/threads_screen.h"
 
+#include <M5Unified.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "ui/draw.h"
 #include "ui/tray.h"
 #include "util/chat_list.h"
+#include "util/list_page.h"
+#include "util/text_edit.h"
 
 namespace ui {
 namespace {
@@ -91,6 +94,9 @@ void ThreadsScreen::onEnter()
     _new_request = false;
     _open_removed = false;
     _list_valid = false;
+    _searching = false;
+    _from_search = false;
+    _query[0] = '\0';
 
     reload();
 
@@ -109,17 +115,120 @@ void ThreadsScreen::onExit()
 
 void ThreadsScreen::reload()
 {
+    _page_offset = 0;
+    _total = 0;
+    _from_search = false;
+    reload_page();
+}
+
+void ThreadsScreen::reload_page()
+{
     _count = 0;
-    if (_store == nullptr) return;
+    _list_valid = false;
+    if (_store == nullptr) {
+        _total = 0;
+        return;
+    }
 
     // Пустой список — не ошибка: тредов могло не быть вообще. Отличить
     // недоступную SD здесь нечем, поэтому экран просто предложит создать
     // первый тред.
-    _count = _store->list_threads(_items, hw::ChatStore::kMaxListedThreads);
+    _count = _store->list_threads_from(
+        _page_offset, _from_search ? _query : nullptr, _items, hw::ChatStore::kMaxListedThreads);
+
+    // Сколько всего: без этого заголовок врал бы «Треды: 40» про год разговоров,
+    // и старые были бы недостижимы вообще.
+    _total = _store->total_found();
 
     if (_selected >= static_cast<int>(_count)) _selected = _count > 0 ? static_cast<int>(_count) - 1 : 0;
     if (_selected < 0) _selected = 0;
     clamp_scroll();
+
+    // В журнал — счётом: листание страниц иначе проверяется только у экрана.
+    Serial.printf("Треды: показано %u из %u, со смещения %u%s\n", static_cast<unsigned>(shown_count()),
+        static_cast<unsigned>(_total), static_cast<unsigned>(_page_offset), _from_search ? " (поиск)" : "");
+}
+
+void ThreadsScreen::next_page()
+{
+    if (!has_next_page()) return;
+
+    const size_t step = _count > 0 ? _count : hw::ChatStore::kMaxListedThreads;
+    const size_t next = listpage::next_offset(_total, _page_offset, step);
+    if (next == _page_offset) return;
+
+    _page_offset = next;
+    reload_page();
+    // После переворота страницы выделяем первую строку: выбор на той же высоте
+    // теперь указывал бы на другой тред, и Enter открыл бы не то.
+    _selected = 0;
+    _first = 0;
+    _redraw_all = true;
+}
+
+void ThreadsScreen::prev_page()
+{
+    if (!has_prev_page()) return;
+
+    const size_t step = hw::ChatStore::kMaxListedThreads;
+    _page_offset = _page_offset > step ? _page_offset - step : 0;
+    reload_page();
+    _selected = _count > 0 ? static_cast<int>(_count) - 1 : 0;
+    clamp_scroll();
+    _redraw_all = true;
+}
+
+void ThreadsScreen::begin_search()
+{
+    // Взведённое удаление снимаем: во время ввода Del — это правка запроса, а
+    // не подтверждение чужого действия.
+    _armed = -1;
+    _armed_slug[0] = '\0';
+    _armed_title[0] = '\0';
+    _searching = true;
+    _query[0] = '\0';
+    _error[0] = '\0';
+    _notice_ok = false;
+    _redraw_all = true;
+}
+
+void ThreadsScreen::run_search()
+{
+    if (_store == nullptr) return;
+
+    _page_offset = 0;
+    _from_search = true;
+    _searching = false;
+    _selected = 0;
+    _first = 0;
+    reload_page();
+
+    Serial.printf("Треды: поиск «%s» — совпадений %u, показано %u\n", _query, static_cast<unsigned>(_total),
+        static_cast<unsigned>(_count));
+
+    if (_count == 0) {
+        notice("Ничего не найдено · Esc — полный список");
+    } else if (_total > _count) {
+        char msg[112];
+        snprintf(msg, sizeof(msg), "Найдено: %u, показано %u · Esc — полный список", static_cast<unsigned>(_total),
+            static_cast<unsigned>(_count));
+        notice(msg);
+    } else {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Найдено: %u · Esc — полный список", static_cast<unsigned>(_count));
+        notice(msg);
+    }
+    _redraw_all = true;
+}
+
+void ThreadsScreen::clear_search()
+{
+    _from_search = false;
+    _searching = false;
+    _query[0] = '\0';
+    reload();
+    if (_selected >= static_cast<int>(_count)) _selected = _count > 0 ? static_cast<int>(_count) - 1 : 0;
+    _redraw_all = true;
 }
 
 void ThreadsScreen::draw_selection()
@@ -153,6 +262,16 @@ bool ThreadsScreen::onKey(const hw::KeyEvent& ev)
     if (_store == nullptr) return true;
 
     if (ev.type == hw::KeyEvent::Type::Special && ev.special == keymap::Special::Escape) {
+        // Ввод запроса — Esc отменяет только его, а не экран: иначе промах
+        // пальцем по «/» уводил бы из списка.
+        if (_searching) {
+            _searching = false;
+            _query[0] = '\0';
+            _error[0] = '\0';
+            _notice_ok = false;
+            _redraw_all = true;
+            return false;
+        }
         // Взведённое удаление снимается, и только второе Esc выходит с экрана:
         // одно нажатие не должно одновременно отменять удаление и уводить.
         if (_armed >= 0) {
@@ -164,11 +283,64 @@ bool ThreadsScreen::onKey(const hw::KeyEvent& ev)
             _redraw_all = true;
             return false;
         }
+        // Поиск убирается первым Esc, выход из экрана — вторым. Подсказка так
+        // и обещает: «Esc — полный список».
+        if (_from_search) {
+            clear_search();
+            return false;
+        }
         return true;
+    }
+
+    // --- Ввод поискового запроса ---
+    if (_searching) {
+        if (ev.type == hw::KeyEvent::Type::Special) {
+            switch (ev.special) {
+            case keymap::Special::Enter:
+                if (_query[0] == '\0') {
+                    clear_search();
+                } else {
+                    run_search();
+                }
+                return false;
+            case keymap::Special::Backspace: {
+                const size_t n = strlen(_query);
+                if (n > 0) _query[textedit::prev_char(_query, n)] = '\0';
+                _redraw_all = true;
+                return false;
+            }
+            case keymap::Special::Space: {
+                const size_t n = strlen(_query);
+                if (n + 2 < sizeof(_query)) {
+                    _query[n] = ' ';
+                    _query[n + 1] = '\0';
+                }
+                _redraw_all = true;
+                return false;
+            }
+            default: return false;
+            }
+        }
+        if (ev.type == hw::KeyEvent::Type::Char && ev.utf8[0] != '\0') {
+            const size_t n = strlen(_query);
+            const size_t add = strlen(ev.utf8);
+            if (n + add < sizeof(_query)) memcpy(_query + n, ev.utf8, add + 1);
+            _redraw_all = true;
+            return false;
+        }
+        return false;
     }
 
     if (is_ctrl_n(ev)) {
         _new_request = true;
+        return false;
+    }
+
+    // «/» — поиск по заголовкам. В ЙЦУКЕН на этой клавише «.», поэтому
+    // принимаем оба: иначе подсказку нельзя было бы выполнить в русской
+    // раскладке, а она раскладку по умолчанию и включает.
+    if (ev.type == hw::KeyEvent::Type::Char && (ev.utf8[0] == '/' || (ev.utf8[0] == '.' && ev.utf8[1] == '\0'))) {
+        begin_search();
         return false;
     }
 
@@ -187,6 +359,20 @@ bool ThreadsScreen::onKey(const hw::KeyEvent& ev)
             if (_selected + 1 < static_cast<int>(_count)) {
                 ++_selected;
                 clamp_scroll();
+            }
+            return false;
+        case keymap::Special::Right:
+            if (has_next_page()) {
+                next_page();
+            } else {
+                notice("Это последняя страница списка");
+            }
+            return false;
+        case keymap::Special::Left:
+            if (has_prev_page()) {
+                prev_page();
+            } else {
+                notice("Это первая страница списка");
             }
             return false;
         case keymap::Special::Enter:
@@ -378,8 +564,23 @@ void ThreadsScreen::draw_header()
 {
     M5.Display.fillRect(0, 0, M5.Display.width(), kListY, TFT_BLACK);
 
-    char left[64];
-    snprintf(left, sizeof(left), "Треды: %u", static_cast<unsigned>(_count));
+    char left[96];
+    if (_searching) {
+        snprintf(left, sizeof(left), "Поиск: %s", _query);
+    } else if (_from_search) {
+        listpage::label("Найдено", _total, _count, left, sizeof(left));
+    } else {
+        // «Треды: 40 из 137»: без второго числа старые разговоры выглядели бы
+        // несуществующими.
+        char* p = left;
+        size_t room = sizeof(left);
+        const size_t written = listpage::label("Треды", _total, shown_count(), p, room);
+        if (written > 0 && _page_offset > 0) {
+            p += written;
+            room -= written;
+            snprintf(p, room, " · с %u", static_cast<unsigned>(_page_offset + 1));
+        }
+    }
     ui::text(left, kMargin, kTitleY, TFT_WHITE);
 
     // Открытый тред — справа: так видно, какой разговор сейчас в чате, и что
@@ -603,8 +804,34 @@ void ThreadsScreen::draw_footer()
 void ThreadsScreen::draw_hints()
 {
     M5.Display.fillRect(0, ui::kHintY - 8, M5.Display.width(), 34, TFT_BLACK);
-    ui::text("↑↓ — выбор · Enter — открыть · Ctrl+N — новый · Del — удалить · Esc — в чат", kMargin, ui::kHintY,
-        kColorFaint);
+
+    if (_searching) {
+        ui::text("Введите запрос · Enter — искать · Esc — отмена", kMargin, ui::kHintY, kColorFaint);
+        return;
+    }
+    if (_from_search) {
+        ui::text("↑↓ — выбор · Enter — открыть · Esc — полный список", kMargin, ui::kHintY, kColorFaint);
+        return;
+    }
+
+    // Подсказка о страницах — только когда они есть: на десяти тредах «← →»
+    // занимали бы место, ничего не делая.
+    if (_total > _count || _page_offset > 0) {
+        const size_t more = _total > shown_count() ? _total - shown_count() : 0;
+        char hint[64];
+        if (more > 0 && listpage::more_hint(more, hint, sizeof(hint)) > 0) {
+            char line[192];
+            snprintf(line, sizeof(line), "↑↓ — выбор · Enter — открыть · %s · ← назад · / — поиск · Esc — в чат", hint);
+            ui::text(line, kMargin, ui::kHintY, kColorFaint);
+            return;
+        }
+        ui::text("↑↓ — выбор · Enter — открыть · ← → — страницы · / — поиск · Esc — в чат", kMargin, ui::kHintY,
+            kColorFaint);
+        return;
+    }
+
+    ui::text(
+        "↑↓ — выбор · Enter — открыть · / — поиск · Del — удалить · Esc — в чат", kMargin, ui::kHintY, kColorFaint);
 }
 
 }  // namespace ui

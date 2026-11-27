@@ -289,6 +289,46 @@ void test_error_text_mentions_example()
     TEST_ASSERT_NOT_NULL(strstr(paths::error_text(Result::Empty), "home/"));
 }
 
+// --- Служебные имена в inbox/ (Р-050) ---------------------------------------
+
+void test_inbox_path_from_iso()
+{
+    char out[paths::kMaxPathLen];
+    TEST_ASSERT_TRUE(paths::inbox_path("2026-11-27T16:15:00+03:00", "note", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("inbox/note-20261127-161500.md", out);
+
+    TEST_ASSERT_TRUE(paths::inbox_path("2026-11-27T16:15:09+03:00", "answer", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("inbox/answer-20261127-161509.md", out);
+
+    // Путь обязан проходить ту же проверку, что и путь от модели.
+    TEST_ASSERT_EQUAL(paths::Result::Ok, paths::check(out));
+}
+
+void test_inbox_path_rejects_bad_input()
+{
+    char out[paths::kMaxPathLen];
+
+    // Не время: заметки с неразборчивой датой столкнулись бы друг с другом.
+    TEST_ASSERT_FALSE(paths::inbox_path("", "note", out, sizeof(out)));
+    TEST_ASSERT_FALSE(paths::inbox_path(nullptr, "note", out, sizeof(out)));
+    TEST_ASSERT_FALSE(paths::inbox_path("2026-11-27", "note", out, sizeof(out)));
+    TEST_ASSERT_FALSE(paths::inbox_path("вчера", "note", out, sizeof(out)));
+    TEST_ASSERT_FALSE(paths::inbox_path("2026-11-27 16:15:00", "note", out, sizeof(out)));
+
+    // Дата вне диапазона.
+    TEST_ASSERT_FALSE(paths::inbox_path("1999-11-27T16:15:00+03:00", "note", out, sizeof(out)));
+    TEST_ASSERT_FALSE(paths::inbox_path("2026-13-27T16:15:00+03:00", "note", out, sizeof(out)));
+    TEST_ASSERT_FALSE(paths::inbox_path("2026-11-27T25:15:00+03:00", "note", out, sizeof(out)));
+
+    // Префикс — только из списка: он попадает в путь и в проверку.
+    TEST_ASSERT_FALSE(paths::inbox_path("2026-11-27T16:15:00+03:00", "смета", out, sizeof(out)));
+    TEST_ASSERT_FALSE(paths::inbox_path("2026-11-27T16:15:00+03:00", "../x", out, sizeof(out)));
+
+    // Маленький буфер — отказ, а не обрезанное имя.
+    char tiny[8];
+    TEST_ASSERT_FALSE(paths::inbox_path("2026-11-27T16:15:00+03:00", "note", tiny, sizeof(tiny)));
+}
+
 int main(int, char**)
 {
     UNITY_BEGIN();
@@ -332,6 +372,9 @@ int main(int, char**)
     RUN_TEST(test_folder_of);
     RUN_TEST(test_name_of);
     RUN_TEST(test_error_text_mentions_example);
+
+    RUN_TEST(test_inbox_path_from_iso);
+    RUN_TEST(test_inbox_path_rejects_bad_input);
 
     return UNITY_END();
 }
