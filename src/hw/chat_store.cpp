@@ -494,7 +494,11 @@ bool ChatStore::append(const api::Role& role, const char* content, const char* t
         return false;
     }
     if (_count >= kMaxMessages) {
-        if (err && err_len > 0) snprintf(err, err_len, "в треде слишком много сообщений");
+        // «В треде слишком много сообщений» — правда, но с ней непонятно, что
+        // делать: человек продолжает писать, а вопрос не уходит. Подсказка
+        // ведёт туда, где выход: Ctrl+N создаёт новый тред (старый остаётся
+        // на карте и открывается из списка Ctrl+T).
+        if (err && err_len > 0) snprintf(err, err_len, "Тред заполнен (200) — Ctrl+N начнёт новый");
         return false;
     }
 
@@ -625,7 +629,11 @@ bool ChatStore::begin_answer(char* err, size_t err_len)
         return false;
     }
     if (_count >= kMaxMessages) {
-        if (err && err_len > 0) snprintf(err, err_len, "в треде слишком много сообщений");
+        // «В треде слишком много сообщений» — правда, но с ней непонятно, что
+        // делать: человек продолжает писать, а вопрос не уходит. Подсказка
+        // ведёт туда, где выход: Ctrl+N создаёт новый тред (старый остаётся
+        // на карте и открывается из списка Ctrl+T).
+        if (err && err_len > 0) snprintf(err, err_len, "Тред заполнен (200) — Ctrl+N начнёт новый");
         return false;
     }
 

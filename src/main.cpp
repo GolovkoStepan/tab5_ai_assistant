@@ -1352,6 +1352,17 @@ void poll_serial_command()
                     update_tray();
                     break;
                 }
+                case serialcmd::Kind::NewThread: {
+                    // То же, что Ctrl+N. Нужно ровно потому, что тред упирается
+                    // в предел 200 сообщений: выйти из этого состояния можно
+                    // только новым тредом, а клавишу скриптом не нажать.
+                    if (g_chat_screen.busy()) {
+                        Serial.println("Serial: идёт ход — новый тред не начинаю, дождитесь ответа или нажмите Esc");
+                        break;
+                    }
+                    g_chat_screen.new_thread();
+                    break;
+                }
                 case serialcmd::Kind::Screen: {
                     // Открыть экран по имени — то же, что нажать Ctrl+…, но из
                     // скрипта. Приёмка «О программе» и меню иначе требует

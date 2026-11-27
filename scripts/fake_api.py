@@ -20,6 +20,7 @@
     ./scripts/fake_api.py --mode error          # «поиск не удался»
     ./scripts/fake_api.py --mode recover        # 500 на первой попытке, успех на повторе
     ./scripts/fake_api.py --mode ok             # контроль: поиск что-то нашёл
+    ./scripts/fake_api.py --mode fat            # вызовы по 3.5 КБ: бюджет истории (Р-047)
     ./scripts/fake_api.py --mode empty --port 8765
 
 Адрес на плате: `http://<ip ноутбука>:8765/api/v1`. Ставится командой
@@ -67,8 +68,53 @@ def tool_call_delta() -> dict:
     }
 
 
-def main_request_stream() -> list[bytes]:
-    """Ответ на основной запрос: попросить поиск и закончить ход."""
+def fat_main_request_stream() -> list[bytes]:
+    """Вызовы с длинными аргументами, разбитые на мелкие дельты.
+
+    Разбивать обязательно: одним событием 6 × 3.5 КБ = 21 КБ, а буфер события
+    прошивки — 16 КБ (`sse::kMaxEventBytes`, Р-038). Такое событие отбрасывается
+    молча, прошивка видит «модель вернула пустой ответ», и проверка бюджета
+    обрывается, не начавшись. Настоящий RouterAI присылает аргументы кусками
+    по нескольку десятков байт — здесь так же.
+    """
+    pad = "x" * 3500
+    events = [sse(chunk({"role": "assistant", "content": None}))]
+
+    for i in range(6):
+        args = json.dumps({"folder": "notes", "запас": pad}, ensure_ascii=False)
+        # Заголовок вызова: id и имя приходят первым куском.
+        events.append(
+            sse(
+                chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": i,
+                                "id": f"call_fake_{i}",
+                                "type": "function",
+                                "function": {"name": "list_docs", "arguments": ""},
+                            }
+                        ]
+                    }
+                )
+            )
+        )
+        # Аргументы — кусками по 400 байт, как живой стриминг.
+        for at in range(0, len(args), 400):
+            events.append(sse(chunk({"tool_calls": [{"index": i, "function": {"arguments": args[at : at + 400]}}]})))
+
+    events.append(sse(chunk({}, finish="tool_calls")))
+    events.append(b"data: [DONE]\n\n")
+    return events
+
+
+def main_request_stream(fat: bool = False) -> list[bytes]:
+    """Ответ на основной запрос: попросить инструмент и закончить ход.
+
+    `fat` — вызовы с длинными аргументами (проверка бюджета истории).
+    """
+    if fat:
+        return fat_main_request_stream()
     return [
         sse(chunk({"role": "assistant", "content": None})),
         sse(chunk(tool_call_delta())),
@@ -183,7 +229,7 @@ class Handler(BaseHTTPRequestHandler):
         saw_tool_result = bool(messages) and messages[-1].get("role") == "tool"
         Handler.mains += 1
         if has_tools and not saw_tool_result:
-            self.stream(main_request_stream())
+            self.stream(main_request_stream(fat=Handler.mode == "fat"))
         else:
             self.stream(final_request_stream())
 
@@ -212,7 +258,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", default="empty", choices=["empty", "error", "recover", "ok"])
+    parser.add_argument("--mode", default="empty", choices=["empty", "error", "recover", "ok", "fat"])
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()

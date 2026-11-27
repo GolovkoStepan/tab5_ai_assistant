@@ -360,6 +360,22 @@ void test_parse_screen_rejects_garbage()
     TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Screen::None), static_cast<int>(serialcmd::parse_screen("chatx", 5)));
 }
 
+/// `new` — новый тред без клавиатуры. Тред упирается в предел 200 сообщений,
+/// и выйти из этого состояния можно только Ctrl+N; команда делает то же самое,
+/// чтобы приёмочный прогон не останавливался.
+void test_parse_new_thread()
+{
+    auto kind_of = [](const char* line) { return serialcmd::parse(line, strlen(line), nullptr, nullptr); };
+
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Kind::NewThread), static_cast<int>(kind_of("new")));
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Kind::NewThread), static_cast<int>(kind_of("NEW")));
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Kind::NewThread), static_cast<int>(kind_of("  new  ")));
+
+    // Не команда: «new» — начало другого слова, а не слово целиком.
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Kind::Unknown), static_cast<int>(kind_of("newthread")));
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Kind::Unknown), static_cast<int>(kind_of("newdoc")));
+}
+
 int main(int, char**)
 {
     UNITY_BEGIN();
@@ -395,5 +411,6 @@ int main(int, char**)
     RUN_TEST(test_null_line);
     RUN_TEST(test_cyrillic_whole_question);
     RUN_TEST(test_single_char_question);
+    RUN_TEST(test_parse_new_thread);
     return UNITY_END();
 }

@@ -983,29 +983,9 @@ size_t ChatScreen::build_body()
         g_hist[i].tool_call_id = m.tool_call_id[0] != '\0' ? m.tool_call_id : nullptr;
         g_hist[i].name = m.name[0] != '\0' ? m.name : nullptr;
         g_hist[i].tool_calls = m.tool_calls;
-    }
-
-    const history::TrimResult trim = history::trim(g_hist, usable, kHistoryBudgetBytes);
-
-    size_t n = 0;
-    g_out[n].role = api::Role::System;
-    g_out[n].content = kSystemPrompt;
-    g_out[n].tool_call_id = nullptr;
-    g_out[n].name = nullptr;
-    g_out[n].tool_calls_json = nullptr;
-    ++n;
-
-    for (size_t i = trim.begin; i < trim.end; ++i) {
-        g_out[n].role = g_hist[i].role;
-        g_out[n].content = g_hist[i].content;
-        g_out[n].tool_call_id = g_hist[i].tool_call_id;
-        g_out[n].name = g_hist[i].name;
-        g_out[n].tool_calls_json = g_hist[i].tool_calls;
-        ++n;
-    }
-
-    if (trim.dropped > 0) {
-        Serial.printf("Чат: в запрос ушло %u сообщений, отброшено %u\n", (unsigned)trim.kept, (unsigned)trim.dropped);
+        // Длина вызовов нужна обрезке: они уходят в тело запроса, и без учёта
+        // в бюджете длинный тред с write_doc перерастал буфер тела.
+        g_hist[i].tool_calls_len = m.tool_calls_len;
     }
 
     api::RequestOptions opt;
@@ -1040,7 +1020,53 @@ size_t ChatScreen::build_body()
     // begin_search()). «Привет» стоит ~0,02 ₽ вместо ~2,17 ₽.
     opt.plugins_json = nullptr;
 
-    return api::build_request(g_out, n, opt, _body, kBodyCap);
+    // Собираем тело, ужимая историю, пока не влезет.
+    //
+    // Бюджет kHistoryBudgetBytes — это оценка по содержимому сообщений, а не
+    // точный размер JSON: экранирование кавычек и переводов строки раздувает
+    // тело (в тексте заметок их много), плюс системная инструкция и схемы
+    // инструментов. Обычно оценка с запасом, но при неудачном сочетании
+    // build_request возвращал 0, и ход падал с «История не собралась» —
+    // выглядело как поломка диалога на ровном месте. Поэтому ужимаем бюджет
+    // вдвое и пробуем снова: лучше ответ по свежей части разговора, чем отказ.
+    size_t budget = kHistoryBudgetBytes;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const history::TrimResult trim = history::trim(g_hist, usable, budget);
+
+        size_t n = 0;
+        g_out[n].role = api::Role::System;
+        g_out[n].content = kSystemPrompt;
+        g_out[n].tool_call_id = nullptr;
+        g_out[n].name = nullptr;
+        g_out[n].tool_calls_json = nullptr;
+        ++n;
+
+        for (size_t i = trim.begin; i < trim.end; ++i) {
+            g_out[n].role = g_hist[i].role;
+            g_out[n].content = g_hist[i].content;
+            g_out[n].tool_call_id = g_hist[i].tool_call_id;
+            g_out[n].name = g_hist[i].name;
+            g_out[n].tool_calls_json = g_hist[i].tool_calls;
+            ++n;
+        }
+
+        const size_t len = api::build_request(g_out, n, opt, _body, kBodyCap);
+        if (len > 0) {
+            if (trim.dropped > 0) {
+                Serial.printf("Чат: в запрос ушло %u сообщений, отброшено %u, бюджет %u КБ\n", (unsigned)trim.kept,
+                    (unsigned)trim.dropped, (unsigned)(budget / 1024));
+            }
+            return len;
+        }
+
+        Serial.printf("Чат: тело запроса не влезло в %u КБ, ужимаю историю (бюджет %u КБ)\n",
+            (unsigned)(kBodyCap / 1024), (unsigned)(budget / 1024));
+        budget /= 2;
+    }
+
+    // Не влезло даже с вдвое ужатой историей трижды: причина не в объёме
+    // истории (схемы инструментов, огромный системный промпт или битый текст).
+    return 0;
 }
 
 bool ChatScreen::append_answer(const char* text, size_t len)
@@ -1425,8 +1451,16 @@ void ChatScreen::log_turn_result()
     // основной запрос плагина не несёт ни в одном шаге, и «привет» стоит
     // ~0,02 ₽ вместо ~2,17 ₽. «Был» здесь означает, что модель позвала
     // `web_search`, и подзапрос с плагином действительно ушёл.
-    Serial.printf("Ответ: %s, источников %u, поиск %s, шагов агента %d\n", _turn_ok ? "ок" : "оборван", src_count,
-        _web_search_failed ? "не удался" : (_web_search_ran ? "был" : "не было"), static_cast<int>(_agent_step));
+    //
+    // Память печатаем в этой же строке: по ней проверяется долгая сессия
+    // (сценарий С6) — если PSRAM убывает от хода к ходу, где-то утечка.
+    // Стоит одна пара вызовов heap_caps_get_free_size() раз на ход, а без неё
+    // утечку на плате не увидеть: экран «О программе» показывает только
+    // мгновенный снимок, и «было 3000, стало 2500» по нему не восстановить.
+    Serial.printf("Ответ: %s, источников %u, поиск %s, шагов агента %d, PSRAM %u КБ, heap %u КБ\n",
+        _turn_ok ? "ок" : "оборван", src_count,
+        _web_search_failed ? "не удался" : (_web_search_ran ? "был" : "не было"), static_cast<int>(_agent_step),
+        static_cast<unsigned>(ESP.getFreePsram() / 1024), static_cast<unsigned>(ESP.getFreeHeap() / 1024));
 
     // Хвост треда как есть: роли и начало текста. По нему видно, что модель
     // сказала после вызова инструмента, а что — до.

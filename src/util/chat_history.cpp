@@ -42,7 +42,10 @@ size_t total_bytes(const Message* msgs, size_t count, size_t from)
 {
     size_t sum = 0;
     for (size_t i = from; i < count; ++i) {
-        sum += msgs[i].content_len;
+        // Вызовы инструментов считаются наравне с текстом: они уходят в тело
+        // запроса, и пропуск их в бюджете делал обрезку бесполезной на длинном
+        // треде с записями заметок (см. include/util/chat_history.h).
+        sum += msgs[i].content_len + msgs[i].tool_calls_len;
     }
     return sum;
 }
@@ -63,7 +66,7 @@ TrimResult trim(const Message* msgs, size_t count, size_t budget)
     size_t start = count;
     size_t bytes = 0;
     for (size_t i = count; i > first; --i) {
-        const size_t b = msgs[i - 1].content_len;
+        const size_t b = msgs[i - 1].content_len + msgs[i - 1].tool_calls_len;
         if (bytes + b > budget && start != count) break;
         bytes += b;
         start = i - 1;
