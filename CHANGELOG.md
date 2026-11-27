@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-27
+
 ### Изменено
 
 - **Веб-поиск стал инструментом `web_search` (Р-040).** Раньше плагин `web`
@@ -901,7 +903,8 @@ SD-карте, а у человека появляется экран архив
 - Юнит-тесты на хосте: 78 тестов (форматирование, раскладка, настройки, список
   сетей), `./scripts/check.sh docker` зелёный.
 
-[Unreleased]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.1.0...v0.2.0
