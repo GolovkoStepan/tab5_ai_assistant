@@ -122,6 +122,22 @@ Kind parse(const char* line, size_t len, const char** out_text, size_t* out_len)
         return Kind::Tz;
     }
 
+    // `screen <имя>` — открыть экран без клавиатуры. Приёмочные прогоны идут
+    // скриптом по Serial (`ask`, `wifi off`, `api`), а экран «О программе» или
+    // меню глазами проверяются нажатием клавиши, которого в скрипте нет.
+    // Проверяем имена здесь же: неизвестное — подсказка, а не молчаливый
+    // переход в чат.
+    if (starts_with_ci(s, n, "screen") && (n == 6 || is_space(s[6]))) {
+        size_t start = 6;
+        while (start < n && is_space(s[start]))
+            ++start;
+        if (start >= n) return Kind::Help;
+        if (parse_screen(s + start, n - start) == Screen::None) return Kind::Help;
+        if (out_text != nullptr) *out_text = s + start;
+        if (out_len != nullptr) *out_len = n - start;
+        return Kind::Screen;
+    }
+
     // `ask <текст>` и `> <текст>`.
     size_t start = 0;
     const bool is_ask = starts_with_ci(s, n, "ask") && (n == 3 || is_space(s[3]));
@@ -154,7 +170,25 @@ const char* help_text()
            "\"thread\" — распечатать тред; \"wifi off\"/\"wifi on\" — выключить и включить сеть; "
            "\"api <адрес>\" — подменить адрес API (проверка на своём сервере); "
            "\"tz <зона>\" — сменить таймзону, формат POSIX: \"tz YEKT-5\"; "
+           "\"screen <имя>\" — открыть экран: chat, threads, notes, wifi, api, help, diag, about; "
            "\"help\" — эта подсказка";
+}
+
+Screen parse_screen(const char* name, size_t len)
+{
+    if (name == nullptr || len == 0) return Screen::None;
+
+    // Сравнение целым словом: `chatx` — не экран. Регистр не важен: набирают
+    // и с телефона, где Caps Lock включён по умолчанию.
+    if (word_is(name, len, "chat") || word_is(name, len, "чат")) return Screen::Chat;
+    if (word_is(name, len, "threads") || word_is(name, len, "треды")) return Screen::Threads;
+    if (word_is(name, len, "notes") || word_is(name, len, "документы")) return Screen::Notes;
+    if (word_is(name, len, "wifi") || word_is(name, len, "wi-fi") || word_is(name, len, "сеть")) return Screen::Wifi;
+    if (word_is(name, len, "api") || word_is(name, len, "настройки")) return Screen::Api;
+    if (word_is(name, len, "help") || word_is(name, len, "меню")) return Screen::Help;
+    if (word_is(name, len, "diag") || word_is(name, len, "диагностика")) return Screen::Diag;
+    if (word_is(name, len, "about") || word_is(name, len, "о-программе")) return Screen::About;
+    return Screen::None;
 }
 
 }  // namespace serialcmd

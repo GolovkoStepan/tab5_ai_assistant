@@ -21,10 +21,9 @@ constexpr int kMargin = 12;
 constexpr int kTitleY = 14;
 constexpr int kListY = 74;
 constexpr int kRowH = 40;
-constexpr int kHintsY = 686;
 
 /// Область ошибки — между списком и подсказками.
-constexpr int kErrorY = kHintsY - 34;
+constexpr int kErrorY = ui::kHintY - 34;
 
 /// Сколько строк помещается между списком и областью ошибки.
 constexpr int kVisibleRows = (kErrorY - 8 - kListY) / kRowH;
@@ -702,8 +701,8 @@ void WifiScreen::draw_hints()
     case Mode::Connecting: hint = "Подключение… · Esc — отменить"; break;
     }
 
-    M5.Display.drawFastHLine(0, kHintsY - 8, M5.Display.width(), kColorFrame);
-    ui::text(hint, kMargin, kHintsY, TFT_DARKGRAY);
+    M5.Display.drawFastHLine(0, ui::kHintY - 8, M5.Display.width(), kColorFrame);
+    ui::text(hint, kMargin, ui::kHintY, TFT_DARKGRAY);
 }
 
 }  // namespace ui

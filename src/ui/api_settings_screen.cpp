@@ -29,7 +29,6 @@ constexpr int kValueY = 30;
 /// Полоса ошибки ниже последней строки формы: полей стало семь (с веб-поиском),
 /// и прежние 400 px накрыли бы строку «Источников».
 constexpr int kErrorY = 540;
-constexpr int kHintsY = 662;
 
 constexpr uint16_t kColorSelected = 0x0320;  // тёмно-зелёный
 constexpr uint16_t kColorDim = TFT_LIGHTGRAY;
@@ -749,14 +748,14 @@ void ApiSettingsScreen::draw_error()
 
 void ApiSettingsScreen::draw_hints()
 {
-    clear_band(kHintsY - 8, M5.Display.height() - (kHintsY - 8));
+    clear_band(ui::kHintY - 8, M5.Display.height() - (ui::kHintY - 8));
 
     if (_mode == Mode::Editing) {
         ui::text("← → — по символам · Ctrl+← → — в начало/конец · Delete — удалить · Enter — принять · Esc — отмена",
-            kMargin, kHintsY, kColorFaint);
+            kMargin, ui::kHintY, kColorFaint);
     } else {
-        ui::text("↑↓ — выбор · Enter — правка/шаг · ←→ — значение · Ctrl+S — сохранить · Esc — выход", kMargin, kHintsY,
-            kColorFaint);
+        ui::text("↑↓ — выбор · Enter — правка/шаг · ←→ — значение · Ctrl+S — сохранить · Esc — выход", kMargin,
+            ui::kHintY, kColorFaint);
     }
 }
 

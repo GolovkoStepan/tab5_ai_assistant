@@ -25,7 +25,6 @@ constexpr int kMargin = 16;
 constexpr int kTitleY = 12;
 constexpr int kListY = 84;
 constexpr int kRowH = 38;
-constexpr int kHintY = 694;
 
 /// Левая колонка меню — до этой координаты. Правая начинается с kRightX.
 constexpr int kLeftW = 470;
@@ -49,6 +48,7 @@ constexpr Item kItems[] = {
     {"Ctrl+A", "Настройки API", HelpScreen::Target::ApiSettings},
     {"Ctrl+W", "Wi-Fi", HelpScreen::Target::Wifi},
     {"Ctrl+D", "Диагностика", HelpScreen::Target::Diagnostic},
+    {"Ctrl+I", "О программе", HelpScreen::Target::About},
 };
 
 constexpr int kItemCount = static_cast<int>(sizeof(kItems) / sizeof(kItems[0]));
@@ -84,7 +84,7 @@ constexpr Section kSections[] = {
     {"Везде",
         {
             "Ctrl+Space — раскладка ЙЦУКЕН / латиница",
-            "Ctrl+M — это меню, Esc — закрыть его",
+            "Ctrl+M — это меню · Ctrl+I — о программе",
             "Ctrl+D — диагностика клавиатуры",
             "Esc на экране — назад, обычно в чат",
         }},
@@ -163,12 +163,12 @@ void HelpScreen::draw()
         draw_rows();
         _drawn_selected = _selected;
 
-        M5.Display.drawFastHLine(0, kHintY - 8, M5.Display.width(), kColorFrame);
+        M5.Display.drawFastHLine(0, ui::kHintY - 8, M5.Display.width(), kColorFrame);
         // Все подсказки меню — внизу, как на остальных экранах. Раньше
         // «Ctrl+M — закрыть» стояла справа в шапке, то есть на месте трея:
         // подсказка про закрытие оказывалась в том углу, который читают как
         // состояние устройства, и спорила со значками Wi-Fi и батареи.
-        ui::text("↑ ↓ — выбор · Enter — открыть · Esc или Ctrl+M — закрыть", kMargin, kHintY, kColorFaint);
+        ui::text("↑ ↓ — выбор · Enter — открыть · Esc или Ctrl+M — закрыть", kMargin, ui::kHintY, kColorFaint);
         return;
     }
 

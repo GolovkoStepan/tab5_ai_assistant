@@ -35,6 +35,7 @@ public:
         ApiSettings,
         Wifi,
         Diagnostic,
+        About,
     };
 
     /// Связей с хранилищами у экрана нет — только чтобы вызывающий код

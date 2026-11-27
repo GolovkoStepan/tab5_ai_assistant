@@ -27,6 +27,7 @@
 #include "hw/keyboard.h"
 #include "hw/settings_store.h"
 #include "hw/wifi.h"
+#include "ui/about_screen.h"
 #include "ui/api_settings_screen.h"
 #include "ui/chat_screen.h"
 #include "ui/draw.h"
@@ -36,7 +37,10 @@
 #include "ui/threads_screen.h"
 #include "ui/tray.h"
 #include "ui/wifi_screen.h"
+#include "util/about_info.h"
+#include "util/backlight.h"
 #include "util/format.h"
+#include "util/power_guard.h"
 #include "util/serial_cmd.h"
 #include "util/tray_state.h"
 #include "version.h"
@@ -53,6 +57,7 @@ ui::ApiSettingsScreen g_api_screen;
 ui::ThreadsScreen g_threads_screen;
 ui::NotesScreen g_notes_screen;
 ui::HelpScreen g_help_screen;
+ui::AboutScreen g_about_screen;
 
 /// Какой экран сейчас на дисплее.
 ///
@@ -67,12 +72,18 @@ enum class Screen : uint8_t {
     Wifi,
     ApiSettings,
     Help,
+    About,
 };
 Screen g_screen = Screen::Chat;
 
 /// Откуда открыли меню помощи: Esc и Ctrl+M возвращают туда, а не в чат.
 /// Из архива возврат в чат читался бы как потеря места, где ты был.
 Screen g_help_return = Screen::Chat;
+
+/// Откуда открыли «О программе». Нужна отдельно от g_help_return: экран
+/// открывается и из меню, и по Ctrl+I. Из меню Esc должен вернуть в меню (как
+/// у остальных его пунктов), а по Ctrl+I — туда, где человек работал.
+Screen g_about_return = Screen::Chat;
 
 namespace {
 
@@ -139,6 +150,15 @@ bool g_has_touch = false;
 
 /// Строка состояния, собирается в setup().
 char g_status[192] = "диагностика…";
+
+/// Сведения о запуске для экрана «О программе». Заполняются в setup(): SD и
+/// клавиатура проверяются там один раз, а экран открывают позже, когда местные
+/// переменные давно не существуют. Хранить их в глобалах дешевле, чем
+/// перепроверять SD на каждый вход в экран (карта читается сотни миллисекунд).
+char g_sd_size[16] = "-";
+bool g_sd_ok = false;
+bool g_kbd_ok = false;
+uint16_t g_kbd_version = 0;
 
 /// Текущая раскладка для экрана.
 const char* layoutName()
@@ -540,6 +560,13 @@ void drawAll()
 
 namespace {
 
+/// Собрать снимок для экрана «О программе».
+///
+/// Объявлено здесь, а определено ниже рядом с остальными сборщиками снимков:
+/// switch_screen() входит в экран и сразу передаёт ему снимок, чтобы первую
+/// секунду не показывать пустые строки.
+ui::AboutScreen::Info build_about_info();
+
 /// Переключить экран. Сначала выгружаем текущий, потом входим в новый: у
 /// каждого экрана есть onExit, и пропустить его значит оставить недописанное
 /// или нестёртый пароль.
@@ -555,6 +582,7 @@ void switch_screen(Screen next)
     case Screen::ApiSettings: g_api_screen.onExit(); break;
     case Screen::Help: break;
     case Screen::Diagnostic: break;
+    case Screen::About: break;
     }
 
     g_screen = next;
@@ -570,6 +598,12 @@ void switch_screen(Screen next)
     // экран не знает, кто его позвал.
     case Screen::Help: g_help_screen.onEnter(); break;
     case Screen::Diagnostic: drawAll(); break;
+    case Screen::About:
+        // Снимок собираем сразу: иначе первую секунду экран показывал бы
+        // пустые строки, а «—» на месте версии читается как поломка.
+        g_about_screen.set_info(build_about_info());
+        g_about_screen.onEnter();
+        break;
     }
 }
 
@@ -658,6 +692,239 @@ void update_power()
     // считается здесь, а не в каждом потребителе.
     g_power.level =
         (g_power.state == m5::charge_state_t::discharging && !g_power.absent) ? M5.Power.getBatteryLevel() : -1;
+}
+
+/// Отметить активность человека: любая клавиша или тап.
+///
+/// Время последней активности ведёт main, а не каждый экран: экранов семь, и
+/// забыть обновить его в одном из них значило бы получить экран, который гаснет
+/// во время работы.
+///
+/// Заодно поднимает подсветку, если она погашена: клавиша и тап должны зажигать
+/// экран сразу, а не через кадр — иначе первое нажатие «потерялось» бы в темноте.
+unsigned long g_activity_at_ms = 0;
+bool g_backlight_on = true;
+
+uint8_t backlight_brightness()
+{
+    return backlight::brightness(g_settings.config().brightness, g_backlight_on);
+}
+
+void apply_backlight()
+{
+    M5.Display.setBrightness(backlight_brightness());
+}
+
+void mark_activity()
+{
+    g_activity_at_ms = millis();
+}
+
+void mark_activity_from_key()
+{
+    mark_activity();
+    if (!g_backlight_on) {
+        g_backlight_on = true;
+        apply_backlight();
+    }
+}
+
+/// @return true, если экран был погашен — тогда тап был «разбудить», и отдавать
+///         его экрану нельзя
+bool mark_activity_from_touch()
+{
+    const bool was_off = !g_backlight_on;
+    mark_activity();
+    if (was_off) {
+        g_backlight_on = true;
+        apply_backlight();
+    }
+    return was_off;
+}
+
+/// Погасить подсветку по таймауту бездействия.
+///
+/// Вызывается в начале каждого кадра, до маршрутизации по экранам: в loop()
+/// много ранних return, и проверка в конце не срабатывала бы на половине
+/// экранов.
+void update_backlight()
+{
+    static unsigned long at_ms = 0;
+
+    const unsigned long now = millis();
+    if (at_ms != 0 && now - at_ms < 200) return;
+    at_ms = now;
+
+    // Подсветку гасим только по бездействию: поднимают её mark_activity_*()
+    // в момент события, иначе первое нажатие терялось бы.
+    const uint32_t timeout = backlight::timeout_ms(g_settings.config().screen_timeout_min);
+    if (timeout == 0 || !g_backlight_on) return;
+    if (now - g_activity_at_ms < timeout) return;
+
+    // Идёт ответ модели — это не бездействие: человек смотрит на приходящий
+    // текст (правило в util/backlight).
+    backlight::Activity a;
+    a.busy = g_chat_screen.busy();
+    if (backlight::decide(g_backlight_on, true, a) != backlight::Action::Off) return;
+
+    g_backlight_on = false;
+    apply_backlight();
+    logLine("Подсветка: экран погас после %u мин бездействия", g_settings.config().screen_timeout_min);
+}
+
+/// Слежение за разрядом: предупреждения и аварийное выключение.
+///
+/// Правила уровня — в util/power_guard (тесты на хосте), здесь только действие:
+/// что показать и когда выключаться. Опрос питания уже идёт раз в секунду в
+/// update_power(), поэтому и проверка идёт с той же частотой, а не по кадрам:
+/// за десять миллисекунд заряд не меняется.
+void update_power_guard()
+{
+    static power::Level shown = power::Level::Ok;
+    static unsigned long at_ms = 0;
+    /// Сколько раз подряд надо увидеть «выключаться», чтобы поверить.
+    ///
+    /// Один замер ничего не доказывает: при снятии аккумулятора ток скачет, и
+    /// напряжение «дышит» — одиночный выброс ниже 5 % был бы ложной тревогой,
+    /// а выключение посреди работы необратимо. Три секунды подряд — уже факт.
+    static int shutdown_streak = 0;
+    constexpr int kShutdownStreak = 3;
+
+    const unsigned long now = millis();
+    if (at_ms != 0 && now - at_ms < 1000) return;
+    at_ms = now;
+
+    power::Thresholds t;
+    t.warn = g_settings.config().battery_warn_percent;
+    t.critical = g_settings.config().battery_critical_percent;
+    t.shutdown = g_settings.config().battery_shutdown_percent;
+
+    // Процент достоверен только на разряде: при заряде и на пустом отсеке он
+    // врёт (см. update_power), поэтому предупреждений там нет вовсе.
+    const bool known = g_power.level >= 0;
+    const power::Level now_level = power::level(known, g_power.level, t);
+
+    if (now_level == power::Level::Shutdown) {
+        ++shutdown_streak;
+    } else {
+        shutdown_streak = 0;
+    }
+
+    if (now_level == power::Level::Ok && shown == power::Level::Ok) return;
+
+    const power::Level next = power::next_shown(shown, now_level);
+    if (next != shown) {
+        shown = next;
+        const char* msg = power::message(shown);
+        if (msg[0] != '\0') {
+            logLine("Питание: %s (%d %%)", msg, g_power.level);
+            g_chat_screen.notice(msg);
+        } else if (g_screen == Screen::Chat) {
+            // Кабель воткнули — снимаем баннер. notice("") очищает строку и
+            // сбрасывает ошибку; на других экранах она не видна, и трогать
+            // чужую строку незачем.
+            g_chat_screen.notice("");
+        }
+    }
+
+    if (shutdown_streak < kShutdownStreak) return;
+
+    // Аварийное выключение. Порядок важен: сначала сохранить тред, потом
+    // погасить экран — иначе на карте остался бы оборванный ответ.
+    logLine("Питание: разряд, выключаюсь");
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_ORANGE);
+    M5.Display.setFont(ui::font());
+    ui::text_center("Батарея разряжена — выключаюсь", M5.Display.width() / 2, 320, TFT_ORANGE);
+    ui::text_center("Сохраняю разговор…", M5.Display.width() / 2, 352, TFT_DARKGRAY);
+
+    g_chat_screen.shutdown_save();
+    g_notes_screen.flush_pending_save();
+
+    Serial.println("Питание: выключение через PMS150G");
+    Serial.flush();
+    M5.Power.powerOff();
+    // Если powerOff() не сработал (нет питания по шине управления), дальше
+    // работать нельзя: разряд ниже порога — предупреждать больше некого.
+    for (;;)
+        delay(1000);
+}
+
+/// Собрать снимок для экрана «О программе».
+///
+/// Только чтение: ничего не меняет и ничего не кэширует, кроме строк, которые
+/// показывает. Вызывается раз в секунду из update_about(), поэтому в нём нет
+/// ни чтения SD, ни обращений к драйверам за пределами дешёвых геттеров.
+ui::AboutScreen::Info build_about_info()
+{
+    ui::AboutScreen::Info info;
+
+    snprintf(info.version, sizeof(info.version), "v%s", APP_VERSION);
+    snprintf(info.model, sizeof(info.model), "%s", g_settings.config().api_model);
+    snprintf(info.api_url, sizeof(info.api_url), "%s", g_settings.config().api_base_url);
+    snprintf(info.timezone, sizeof(info.timezone), "%s", g_settings.config().timezone);
+
+    // Время — местное, то же, что в трее. Пока оно не выставлено, строки нет:
+    // «01 янв. 1970» рядом с версией читалось бы как сломанные часы, а не как
+    // «сеть ещё не подключилась».
+    if (hw::clock_sync::valid()) {
+        const time_t now = time(nullptr);
+        struct tm t{};
+        localtime_r(&now, &t);
+        snprintf(info.local_time, sizeof(info.local_time), "%02d.%02d.%04d %02d:%02d", t.tm_mday, t.tm_mon + 1,
+            t.tm_year + 1900, t.tm_hour, t.tm_min);
+    }
+
+    about::uptime_label(static_cast<uint32_t>(millis()), info.uptime, sizeof(info.uptime));
+
+    snprintf(info.heap, sizeof(info.heap), "%u КБ свободно", static_cast<unsigned>(ESP.getFreeHeap() / 1024));
+    snprintf(info.psram, sizeof(info.psram), "%u КБ свободно", static_cast<unsigned>(ESP.getFreePsram() / 1024));
+
+    if (g_sd_ok) {
+        snprintf(info.sd_card, sizeof(info.sd_card), "%s, запись есть", g_sd_size);
+    } else if (g_sd_size[0] != '\0' && strcmp(g_sd_size, "-") != 0) {
+        snprintf(info.sd_card, sizeof(info.sd_card), "%s, только чтение", g_sd_size);
+    } else {
+        snprintf(info.sd_card, sizeof(info.sd_card), "%s", "нет карты");
+    }
+
+    if (g_kbd_ok) {
+        snprintf(info.keyboard, sizeof(info.keyboard), "A164, прошивка v%u", static_cast<unsigned>(g_kbd_version));
+    } else {
+        snprintf(info.keyboard, sizeof(info.keyboard), "%s", "не найдена");
+    }
+
+    if (g_wifi.connected()) {
+        const char* ip = g_wifi.ip_text();
+        snprintf(info.wifi, sizeof(info.wifi), "%s, %s, %d дБм", g_wifi.ssid(),
+            (ip != nullptr && ip[0] != '\0') ? ip : "адрес неизвестен", g_wifi.rssi());
+    } else if (g_wifi.connecting()) {
+        snprintf(info.wifi, sizeof(info.wifi), "%s", "подключение…");
+    } else if (!g_wifi.radio_on()) {
+        snprintf(info.wifi, sizeof(info.wifi), "%s", "радио выключено");
+    } else {
+        snprintf(info.wifi, sizeof(info.wifi), "%s", "нет");
+    }
+
+    return info;
+}
+
+/// Обновить снимок экрана «О программе» раз в секунду.
+///
+/// Отдельно от update_tray(), хотя частота та же: снимок нужен, только когда
+/// экран открыт, и собирать его на остальных экранах значило бы дёргать Wi-Fi
+/// ради строки, которую никто не видит. Часы и трей обновляются сами.
+void update_about()
+{
+    static unsigned long at_ms = 0;
+
+    if (g_screen != Screen::About) return;
+
+    const unsigned long now = millis();
+    if (at_ms != 0 && now - at_ms < 1000) return;
+    at_ms = now;
+
+    g_about_screen.set_info(build_about_info());
 }
 
 /// Собрать снимок для трея.
@@ -826,23 +1093,21 @@ void setup()
     // Arduino не включает LDO4 - питание карты. Без этого mount падает
     // в send_op_cond timeout (0x107). esp-bsp делает это явно.
     SD_MMC.setPowerChannel(4);
-    bool sd_ok = false;
-    char sd_size[16] = "-";
     if (SD_MMC.begin(cfg::kMountPoint, false) && SD_MMC.cardType() != CARD_NONE) {
-        format_bytes(SD_MMC.totalBytes(), sd_size, sizeof(sd_size));
+        format_bytes(SD_MMC.totalBytes(), g_sd_size, sizeof(g_sd_size));
         File probe = SD_MMC.open("/.probe", FILE_WRITE);
         if (probe) {
             probe.print("ok");
             probe.close();
             SD_MMC.remove("/.probe");
-            sd_ok = true;
+            g_sd_ok = true;
         }
-        logLine("SD: %s, запись %s", sd_size, sd_ok ? "работает" : "НЕ работает");
+        logLine("SD: %s, запись %s", g_sd_size, g_sd_ok ? "работает" : "НЕ работает");
     } else {
         logLine("SD: НЕ смонтирована");
     }
 
-    ui::splash_step(ui::SplashStep::Storage, sd_ok ? sd_size : "нет карты");
+    ui::splash_step(ui::SplashStep::Storage, g_sd_ok ? g_sd_size : "нет карты");
 
     // --- Настройки ----------------------------------------------------------
     // Секреты читаются из NVS в любом случае, файл — только если SD доступна.
@@ -853,9 +1118,10 @@ void setup()
     ui::splash_step(ui::SplashStep::Settings, g_settings.config().api_model);
 
     // --- Клавиатура ---------------------------------------------------------
-    const bool kbd_ok = g_keyboard.begin();
-    if (kbd_ok) {
-        logLine("Клавиатура: OK, прошивка v%u", g_keyboard.firmwareVersion());
+    g_kbd_ok = g_keyboard.begin();
+    g_kbd_version = g_kbd_ok ? g_keyboard.firmwareVersion() : 0;
+    if (g_kbd_ok) {
+        logLine("Клавиатура: OK, прошивка v%u", g_kbd_version);
         // Заводская яркость светодиодов — 20; в тёмной комнате это заметно
         // слепит, а смысла в яркой индикации нет: светодиоды тут для
         // «взглянул и понял», а не для освещения. Половина от заводской.
@@ -864,15 +1130,19 @@ void setup()
         logLine("Клавиатура: НЕ отвечает на адресе 0x%02X", cfg::kKeyboardAddr);
     }
 
-    ui::splash_step(ui::SplashStep::Keyboard, kbd_ok ? "A164" : "не найдена");
+    ui::splash_step(ui::SplashStep::Keyboard, g_kbd_ok ? "A164" : "не найдена");
 
     // Настройки, которые видны сразу: яркость и раскладка. Читались они и
     // раньше, но не применялись — config.json существовал, а экран и
     // клавиатура жили на значениях по умолчанию. Это как раз то расхождение
     // документации с кодом, которое находят глазами, а не тестами.
-    M5.Display.setBrightness(g_settings.config().brightness);
+    // Яркость 0 в настройках — это «всегда темно», а не «не гасить». Правило
+    // одно на весь код (util/backlight), поэтому применяется оно здесь, а не
+    // сырое значение из файла.
+    apply_backlight();
     g_keyboard.setLayout(g_settings.config().layout_russian ? keymap::Layout::Russian : keymap::Layout::Latin);
-    logLine("Яркость %u, раскладка %s", g_settings.config().brightness, layoutName());
+    logLine("Яркость %u, раскладка %s, таймаут подсветки %u мин", g_settings.config().brightness, layoutName(),
+        g_settings.config().screen_timeout_min);
 
     // --- Часы ---------------------------------------------------------------
     // Таймзона нужна до первого треда: по ней чат формирует метки времени в
@@ -933,8 +1203,8 @@ void setup()
     g_help_screen.init();
 
     // Компактная строка состояния: подробности остались в Serial.
-    snprintf(g_status, sizeof(g_status), "%s · SD %s%s · Wi-Fi %s · клав %s", power_status, sd_size,
-        sd_ok ? " RW" : " RO", wifi_ok ? "OK" : "нет", kbd_ok ? "v1" : "нет");
+    snprintf(g_status, sizeof(g_status), "%s · SD %s%s · Wi-Fi %s · клав %s", power_status, g_sd_size,
+        g_sd_ok ? " RW" : " RO", wifi_ok ? "OK" : "нет", g_kbd_ok ? "v1" : "нет");
     logLine("Статус: %s", g_status);
 
     // Стартуем в меню, а не в чате. При включении человек ещё не знает, зачем
@@ -1082,6 +1352,57 @@ void poll_serial_command()
                     update_tray();
                     break;
                 }
+                case serialcmd::Kind::Screen: {
+                    // Открыть экран по имени — то же, что нажать Ctrl+…, но из
+                    // скрипта. Приёмка «О программе» и меню иначе требует
+                    // человека у клавиатуры, и прогон не повторяется.
+                    char name[24];
+                    if (text_len >= sizeof(name)) {
+                        Serial.println("Serial: имя экрана слишком длинное");
+                        break;
+                    }
+                    memcpy(name, text, text_len);
+                    name[text_len] = '\0';
+
+                    const serialcmd::Screen target = serialcmd::parse_screen(name, text_len);
+                    if (target == serialcmd::Screen::None) {
+                        Serial.printf("Serial: экрана «%s» нет — %s\n", name, serialcmd::help_text());
+                        break;
+                    }
+
+                    // Из редактора заметки — та же блокировка, что у Ctrl+…:
+                    // уход молча выбросил бы правку.
+                    if (g_screen == Screen::Notes && g_notes_screen.has_unsaved_edits()) {
+                        g_notes_screen.notice("Есть несохранённые правки — Ctrl+S сохранить · Esc выйти");
+                        Serial.println("Serial: экран не открыт, в заметке есть несохранённые правки");
+                        break;
+                    }
+
+                    switch (target) {
+                    case serialcmd::Screen::Chat: switch_screen(Screen::Chat); break;
+                    case serialcmd::Screen::Threads: switch_screen(Screen::Threads); break;
+                    case serialcmd::Screen::Notes: switch_screen(Screen::Notes); break;
+                    case serialcmd::Screen::Wifi: switch_screen(Screen::Wifi); break;
+                    case serialcmd::Screen::Api: switch_screen(Screen::ApiSettings); break;
+                    case serialcmd::Screen::Help:
+                        // Как Ctrl+M: запоминаем, откуда пришли, чтобы Esc
+                        // вернул туда же. Только не из самого меню: иначе Esc
+                        // повёл бы в меню же, и выйти было бы нечем.
+                        if (g_screen != Screen::Help) g_help_return = g_screen;
+                        switch_screen(Screen::Help);
+                        break;
+                    case serialcmd::Screen::Diag: switch_screen(Screen::Diagnostic); break;
+                    case serialcmd::Screen::About:
+                        // Та же оговорка: `screen about` на самом экране
+                        // «О программе» не должен делать возврат в него же.
+                        if (g_screen != Screen::About) g_about_return = g_screen;
+                        switch_screen(Screen::About);
+                        break;
+                    case serialcmd::Screen::None: break;
+                    }
+                    Serial.printf("Serial: экран %s открыт\n", name);
+                    break;
+                }
                 case serialcmd::Kind::Unknown: Serial.println(serialcmd::help_text()); break;
                 case serialcmd::Kind::None: break;
                 }
@@ -1105,11 +1426,21 @@ void loop()
 
     poll_serial_command();
 
+    // --- Подсветка ----------------------------------------------------------
+    // До всего остального: экран мог погаснуть по таймауту, и первое нажатие
+    // должно разбудить его, а не потеряться.
+    update_backlight();
+
     // --- Клавиатура ---------------------------------------------------------
     hw::KeyEvent ev;
     bool last_changed = false;
 
     while (g_keyboard.poll(ev)) {
+        // Любая клавиша — активность человека: экран просыпается, таймаут
+        // бездействия начинается заново. Ставится до разбора события, потому
+        // что «проснуться» должно и от клавиши, которую экран не обработает.
+        mark_activity_from_key();
+
         // Переключение раскладки обрабатывается на любом экране: драйвер уже
         // сменил её внутри poll(), а здесь мы её запоминаем. Раньше это делал
         // только диагностический экран, и из чата раскладка переключалась, но
@@ -1148,7 +1479,8 @@ void loop()
             const bool nav = strcmp(ev.utf8, "w") == 0 || strcmp(ev.utf8, "ц") == 0 || strcmp(ev.utf8, "a") == 0 ||
                              strcmp(ev.utf8, "ф") == 0 || strcmp(ev.utf8, "t") == 0 || strcmp(ev.utf8, "е") == 0 ||
                              strcmp(ev.utf8, "o") == 0 || strcmp(ev.utf8, "щ") == 0 || strcmp(ev.utf8, "d") == 0 ||
-                             strcmp(ev.utf8, "в") == 0 || strcmp(ev.utf8, "m") == 0 || strcmp(ev.utf8, "ь") == 0;
+                             strcmp(ev.utf8, "в") == 0 || strcmp(ev.utf8, "m") == 0 || strcmp(ev.utf8, "ь") == 0 ||
+                             strcmp(ev.utf8, "i") == 0 || strcmp(ev.utf8, "ш") == 0;
             if (nav && g_screen == Screen::Notes && g_notes_screen.has_unsaved_edits()) {
                 g_notes_screen.notice("Есть несохранённые правки — Ctrl+S сохранить · Esc выйти");
                 continue;
@@ -1176,6 +1508,18 @@ void loop()
                 switch_screen(g_screen == Screen::Diagnostic ? Screen::Chat : Screen::Diagnostic);
                 continue;
             }
+            // Ctrl+I — «О программе». «ш» — та же клавиша в ЙЦУКЕН.
+            if (strcmp(ev.utf8, "i") == 0 || strcmp(ev.utf8, "ш") == 0) {
+                if (g_screen == Screen::About) {
+                    switch_screen(g_about_return);
+                } else {
+                    // Как у меню: запоминаем, откуда пришли, чтобы Esc вернул
+                    // туда же, а не всегда в чат.
+                    g_about_return = g_screen;
+                    switch_screen(Screen::About);
+                }
+                continue;
+            }
             // Ctrl+M — меню и справка. «ь» — та же клавиша в ЙЦУКЕН.
             //
             // Меню помнит, откуда его открыли: Esc возвращает туда. Уходить
@@ -1198,6 +1542,14 @@ void loop()
         // выше — в списке глобальных команд, потому что он и открывает меню.
         if (g_screen == Screen::Help) {
             if (g_help_screen.onKey(ev)) switch_screen(g_help_return);
+            continue;
+        }
+
+        // «О программе» — только чтение: Esc закрывает, остальное не имеет
+        // смысла. Возврат туда, откуда пришли (в меню после пункта Ctrl+M или
+        // в рабочий экран после Ctrl+I).
+        if (g_screen == Screen::About) {
+            if (g_about_screen.onKey(ev)) switch_screen(g_about_return);
             continue;
         }
 
@@ -1286,10 +1638,27 @@ void loop()
     g_api_screen.tick();
     hw::clock_sync::tick(g_wifi.connected());
     update_power();
+    update_power_guard();
     update_tray();
+    update_about();
     update_leds();
 
     const auto& td = M5.Touch.getDetail();
+
+    // Тап — тоже активность. Отдельно от клавиш: сенсор есть у всех экранов, и
+    // человек может разбудить устройство, не трогая клавиатуру.
+    static bool swallow_release = false;
+    if (td.wasPressed()) {
+        // Тап, которым только что разбудили экран, экрану не отдаём: человек
+        // ткнул в темноту, чтобы посмотреть, а не чтобы нажать невидимую
+        // кнопку. Отпускание случится в следующем кадре, поэтому запоминаем.
+        swallow_release = mark_activity_from_touch();
+    }
+    if (td.wasReleased() && swallow_release) {
+        swallow_release = false;
+        delay(10);
+        return;
+    }
 
     // --- Тап по трею ---------------------------------------------------------
     // Проверяется ДО маршрутизации по экранам: трей есть на всех, и его
@@ -1328,6 +1697,7 @@ void loop()
     if (g_screen == Screen::Chat) {
         if (td.wasReleased()) g_chat_screen.onTouch(td.x, td.y);
         if (g_chat_screen.dirty()) g_chat_screen.draw();
+
         delay(10);
         return;
     }
@@ -1363,6 +1733,18 @@ void loop()
         return;
     }
 
+    if (g_screen == Screen::About) {
+        // На экране нет кнопок: касание работает только как «назад» по нижней
+        // полосе, а всё остальное проглатывается. Возврат — туда, откуда
+        // открыли: из меню — в меню (как у остальных пунктов Ctrl+M), по
+        // Ctrl+I — в рабочий экран.
+        if (td.wasReleased() && g_about_screen.onTouch(td.x, td.y)) switch_screen(g_about_return);
+        if (g_about_screen.dirty()) g_about_screen.draw();
+
+        delay(10);
+        return;
+    }
+
     if (g_screen == Screen::Help) {
         // Переход выполняет main: экран помощи не знает про остальные экраны.
         if (td.wasReleased()) g_help_screen.onTouch(td.x, td.y);
@@ -1375,6 +1757,14 @@ void loop()
             case ui::HelpScreen::Target::ApiSettings: switch_screen(Screen::ApiSettings); break;
             case ui::HelpScreen::Target::Wifi: switch_screen(Screen::Wifi); break;
             case ui::HelpScreen::Target::Diagnostic: switch_screen(Screen::Diagnostic); break;
+            case ui::HelpScreen::Target::About:
+                // Из меню «О программе» Esc возвращает в меню — как у
+                // остальных пунктов, где Esc ведёт обратно в список. Иначе
+                // человек после справки оказывался бы в чате, а не там, где
+                // выбирал пункт.
+                g_about_return = Screen::Help;
+                switch_screen(Screen::About);
+                break;
             case ui::HelpScreen::Target::None: break;
             }
             delay(10);

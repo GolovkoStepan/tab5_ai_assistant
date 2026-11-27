@@ -48,7 +48,6 @@ constexpr int kLineH = 22;
 constexpr int kRowsY = 586;
 constexpr int kStatusY = 586;
 constexpr int kErrorY = 622;
-constexpr int kHintsY = 692;
 
 /// Сколько строк текста видно: между полями заголовка и нижней полосой.
 constexpr int kTextRows = (kRowsY - kTextY) / kLineH;
@@ -345,6 +344,15 @@ void NotesScreen::begin_edit()
     _desired_col = 0;
     _scroll = 0;
     _redraw_all = true;
+}
+
+void NotesScreen::flush_pending_save()
+{
+    // Сохраняем только если правили правда что-то: _dirty ставится при
+    // изменении текста, а не при открытии файла. Иначе выключение переписывало
+    // бы документ без причины — и «updated» менялся бы просто так.
+    if (!_dirty || _mode != Mode::Edit) return;
+    save_edit();
 }
 
 void NotesScreen::save_edit()
@@ -795,7 +803,7 @@ void NotesScreen::draw()
             // Полоса состояния и ошибки: в списке статуса нет, но на этом месте
             // осталась бы строка «строка 3, столбец 5» из просмотра, из
             // которого мы сюда вернулись.
-            M5.Display.fillRect(0, kStatusY, M5.Display.width(), kHintsY - 8 - kStatusY, TFT_BLACK);
+            M5.Display.fillRect(0, kStatusY, M5.Display.width(), ui::kHintY - 8 - kStatusY, TFT_BLACK);
             draw_header();
             draw_list();
             draw_footer();
@@ -1092,7 +1100,7 @@ void NotesScreen::draw_caret()
 
 void NotesScreen::draw_status()
 {
-    M5.Display.fillRect(0, kStatusY, M5.Display.width(), kHintsY - 8 - kStatusY, TFT_BLACK);
+    M5.Display.fillRect(0, kStatusY, M5.Display.width(), ui::kHintY - 8 - kStatusY, TFT_BLACK);
 
     static char buf[176];
 
@@ -1119,7 +1127,7 @@ void NotesScreen::draw_status()
 
 void NotesScreen::draw_footer()
 {
-    M5.Display.fillRect(0, kErrorY, M5.Display.width(), kHintsY - 8 - kErrorY, TFT_BLACK);
+    M5.Display.fillRect(0, kErrorY, M5.Display.width(), ui::kHintY - 8 - kErrorY, TFT_BLACK);
 
     static char buf[192];
 
@@ -1152,26 +1160,27 @@ void NotesScreen::draw_footer()
 
 void NotesScreen::draw_hints()
 {
-    M5.Display.fillRect(0, kHintsY - 8, M5.Display.width(), 34, TFT_BLACK);
+    M5.Display.fillRect(0, ui::kHintY - 8, M5.Display.width(), 34, TFT_BLACK);
 
     // В подтверждении клавиши написаны в самом вопросе, а подсказки прежнего
     // режима к нему не относятся.
     if (_mode == Mode::Confirm) return;
 
     if (_mode == Mode::Edit) {
-        ui::text(
-            "Enter — новая строка · Ctrl+S — сохранить · Ctrl+Z — отмена · Esc — выйти", kMargin, kHintsY, kColorFaint);
+        ui::text("Enter — новая строка · Ctrl+S — сохранить · Ctrl+Z — отмена · Esc — выйти", kMargin, ui::kHintY,
+            kColorFaint);
         return;
     }
     if (_mode == Mode::Search) {
-        ui::text("Введите запрос · Enter — искать · Esc — отмена", kMargin, kHintsY, kColorFaint);
+        ui::text("Введите запрос · Enter — искать · Esc — отмена", kMargin, ui::kHintY, kColorFaint);
         return;
     }
     if (_mode == Mode::View) {
-        ui::text("Enter — править · ↑↓ — прокрутка · Esc — к списку", kMargin, kHintsY, kColorFaint);
+        ui::text("Enter — править · ↑↓ — прокрутка · Esc — к списку", kMargin, ui::kHintY, kColorFaint);
         return;
     }
-    ui::text("↑↓ — выбор · Enter — открыть · / — поиск · Del — удалить · Esc — в чат", kMargin, kHintsY, kColorFaint);
+    ui::text(
+        "↑↓ — выбор · Enter — открыть · / — поиск · Del — удалить · Esc — в чат", kMargin, ui::kHintY, kColorFaint);
 }
 
 void NotesScreen::fail(const char* text)

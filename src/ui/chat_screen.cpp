@@ -25,6 +25,7 @@
 #include "util/chat_view.h"
 #include "util/format.h"
 #include "util/markdown.h"
+#include "util/offline.h"
 
 namespace ui {
 namespace {
@@ -39,7 +40,6 @@ constexpr int kInputY = 566;
 constexpr int kInputH = 46;
 constexpr int kStatusY = 620;
 constexpr int kErrorY = 652;
-constexpr int kHintY = 692;
 
 /// Ширина полоски-маркера слева от сообщения.
 constexpr int kBarW = 4;
@@ -530,6 +530,40 @@ void ChatScreen::notice(const char* text)
     snprintf(_error, sizeof(_error), "%s", text);
     _failed = false;
     _redraw_error = true;
+}
+
+void ChatScreen::shutdown_save()
+{
+    if (_mode == Mode::Idle) {
+        // Ответа нет — дописывать нечего. Но если остался несохранённый хвост
+        // (например, агентский ход уже завершил текст, а flush не прошёл),
+        // сохраняем и его: при выключении он пропадёт вместе с памятью.
+        if (_store != nullptr && _store->has_unsaved()) {
+            char err[96];
+            if (!_store->flush_last(err, sizeof(err))) Serial.printf("Чат: хвост треда не сохранён — %s\n", err);
+        }
+        return;
+    }
+
+    // Запрос идёт: обрываем его так же, как по Esc, и сохраняем столько, сколько
+    // модель успела сказать. finish_answer(true) ставит пометку «неполный» —
+    // иначе после такой записи нельзя отличить целый ответ от оборванного.
+    const hw::ChatMessage* last = _store != nullptr ? _store->last() : nullptr;
+    const bool has_text = last != nullptr && last->role == api::Role::Assistant && last->content_len > 0;
+
+    if (_api != nullptr && _api->busy()) _api->cancel();
+
+    if (has_text) {
+        _answer.partial = true;
+        finish_answer(true, "shutdown");
+        Serial.println("Чат: ответ сохранён неполным перед выключением");
+        return;
+    }
+
+    // Текста нет: пустую реплику модели в файл писать незачем, она
+    // неотличима от «модель ничего не сказала».
+    if (last != nullptr && last->role == api::Role::Assistant) _store->drop_last();
+    Serial.println("Чат: ответа не было, ход отменён");
 }
 
 void ChatScreen::fill_model_status(led::Status& s) const
@@ -1861,6 +1895,10 @@ void ChatScreen::tick()
     if (strcmp(net_now, _net_cache) != 0) {
         snprintf(_net_cache, sizeof(_net_cache), "%s", net_now);
         _redraw_title = true;
+        // Баннер офлайн-режима живёт в полосе сообщений, а её видимость зависит
+        // от того же состояния сети. Без этой строки баннер остался бы на
+        // экране после подключения до следующей ошибки или подсказки.
+        _redraw_error = true;
     }
 
     // Ход закончился: либо закрываем ответ, либо идём на следующий шаг агента.
@@ -2621,7 +2659,22 @@ void ChatScreen::draw_error()
     // Полоса на всю ширину: у ошибки своя подложка, у подсказки — чёрный фон.
     // Раньше отказ сервера и «введите вопрос» были одной оранжевой строкой.
     M5.Display.fillRect(0, kErrorY, M5.Display.width(), 30, _failed ? kColorErrorBg : TFT_BLACK);
-    if (_error[0] == '\0') return;
+
+    // Нет ни сообщения, ни ошибки, а сети нет — в этой же полосе стоит баннер
+    // офлайн-режима. Место выбрано то же намеренно: вторая строка рядом
+    // спорила бы с ошибкой, а правило показа (util/offline) как раз говорит,
+    // что сообщение важнее баннера.
+    if (_error[0] == '\0') {
+        const bool connected = _wifi != nullptr && _wifi->connected();
+        const bool connecting = _wifi != nullptr && _wifi->connecting();
+        if (offline::banner_visible(connected, connecting, false)) {
+            char buf[192];
+            const char* shown =
+                ui::fit_width(offline::banner_text(), M5.Display.width() - 2 * kMarginX, buf, sizeof(buf));
+            ui::text(shown, kMarginX, kErrorY, kColorDim);
+        }
+        return;
+    }
 
     if (_failed) {
         // Длинный отказ («Лимит трат по ключу исчерпан: 100,22 из 100,00 руб.
@@ -2642,7 +2695,7 @@ void ChatScreen::draw_error()
 
 void ChatScreen::draw_hints()
 {
-    M5.Display.fillRect(0, kHintY - 6, M5.Display.width(), 30, TFT_BLACK);
+    M5.Display.fillRect(0, ui::kHintY - 6, M5.Display.width(), 30, TFT_BLACK);
 
     // Одна короткая строка. Раньше здесь были две колонки — «что делает
     // экран» слева и «куда уйти» справа, — и они перестали помещаться в
@@ -2653,10 +2706,10 @@ void ChatScreen::draw_hints()
     // «Esc — очистить ввод» сказано полностью: рядом есть «прервать», и
     // голое «Esc — очистить» путалось бы с остановкой ответа.
     if (_mode == Mode::Confirming) {
-        ui::text("Удаление необратимо · Enter — удалить · Esc — отмена", kMarginX, kHintY, kColorPartial);
+        ui::text("Удаление необратимо · Enter — удалить · Esc — отмена", kMarginX, ui::kHintY, kColorPartial);
         return;
     }
-    ui::text("Enter — отправить · Esc — прервать или очистить · ↑↓ — прокрутка · Ctrl+M — меню", kMarginX, kHintY,
+    ui::text("Enter — отправить · Esc — прервать или очистить · ↑↓ — прокрутка · Ctrl+M — меню", kMarginX, ui::kHintY,
         kColorFaint);
 }
 

@@ -302,6 +302,64 @@ void test_single_char_question()
     TEST_ASSERT_EQUAL_STRING("я", out);
 }
 
+/// `screen <имя>` — открыть экран без клавиатуры, тем же путём, что Ctrl+….
+void test_screen_names()
+{
+    auto parse_screen_cmd = [](const char* line) {
+        const char* text = nullptr;
+        size_t text_len = 0;
+        const serialcmd::Kind kind = serialcmd::parse(line, strlen(line), &text, &text_len);
+        if (kind != serialcmd::Kind::Screen) return serialcmd::Screen::None;
+        return serialcmd::parse_screen(text, text_len);
+    };
+
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Screen::Chat), static_cast<int>(parse_screen_cmd("screen chat")));
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Screen::About), static_cast<int>(parse_screen_cmd("screen about")));
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Screen::Help), static_cast<int>(parse_screen_cmd("screen help")));
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Screen::Notes), static_cast<int>(parse_screen_cmd("screen notes")));
+
+    // Регистр имени не важен.
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Screen::Diag), static_cast<int>(parse_screen_cmd("screen DIAG")));
+
+    // Лишние пробелы не мешают: имя разбирается как слово.
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Screen::Wifi), static_cast<int>(parse_screen_cmd("screen   wifi")));
+}
+
+/// `screen` без имени и с незнакомым именем — подсказка, а не молчаливый
+/// переход в чат: человек должен узнать, какие имена есть.
+void test_screen_without_name_is_help()
+{
+    char out[8];
+    parse_text("screen", out, sizeof(out), serialcmd::Kind::Help);
+    parse_text("screen   ", out, sizeof(out), serialcmd::Kind::Help);
+    parse_text("screen chatx", out, sizeof(out), serialcmd::Kind::Help);
+    parse_text("screen 42", out, sizeof(out), serialcmd::Kind::Help);
+}
+
+/// Слово, начинающееся с «screen», но не команда.
+void test_screen_prefix_is_not_screen()
+{
+    char out[8];
+    parse_text("screens", out, sizeof(out), serialcmd::Kind::Unknown);
+    parse_text("screenplay", out, sizeof(out), serialcmd::Kind::Unknown);
+}
+
+/// Подсказка должна упоминать `screen`: иначе о команде никто не узнает.
+void test_help_mentions_screen()
+{
+    const char* text = serialcmd::help_text();
+    TEST_ASSERT_NOT_NULL(strstr(text, "screen"));
+}
+
+/// Имя без строки `screen` — не команда: `parse_screen` вызывают только после
+/// проверки вида строки, а сам по себе он на мусор отвечает None.
+void test_parse_screen_rejects_garbage()
+{
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Screen::None), static_cast<int>(serialcmd::parse_screen(nullptr, 0)));
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Screen::None), static_cast<int>(serialcmd::parse_screen("", 0)));
+    TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Screen::None), static_cast<int>(serialcmd::parse_screen("chatx", 5)));
+}
+
 int main(int, char**)
 {
     UNITY_BEGIN();
@@ -328,6 +386,11 @@ int main(int, char**)
     RUN_TEST(test_tz_without_argument_is_help);
     RUN_TEST(test_tz_prefix_is_not_tz);
     RUN_TEST(test_help_mentions_tz);
+    RUN_TEST(test_screen_names);
+    RUN_TEST(test_screen_without_name_is_help);
+    RUN_TEST(test_screen_prefix_is_not_screen);
+    RUN_TEST(test_help_mentions_screen);
+    RUN_TEST(test_parse_screen_rejects_garbage);
     RUN_TEST(test_ask_prefix_is_not_ask);
     RUN_TEST(test_null_line);
     RUN_TEST(test_cyrillic_whole_question);

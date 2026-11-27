@@ -19,6 +19,23 @@
 
 namespace serialcmd {
 
+/// Экран, который можно открыть командой `screen <имя>`.
+///
+/// Отдельный перечень, а не `Screen` из `main.cpp`: разбор строки — чистая
+/// функция, и тащить в неё перечисление прошивки значило бы сделать её
+/// непроверяемой на хосте. Соответствие «здесь» ↔ «в main» — один `switch`.
+enum class Screen : uint8_t {
+    None,     ///< имя не распознано
+    Chat,     ///< `screen chat`
+    Threads,  ///< `screen threads` — список тредов
+    Notes,    ///< `screen notes` — архив документов
+    Wifi,     ///< `screen wifi`
+    Api,      ///< `screen api` — настройки API
+    Help,     ///< `screen help` — меню и справка
+    Diag,     ///< `screen diag` — диагностика клавиатуры
+    About,    ///< `screen about` — «О программе»
+};
+
 /// Что делать с пришедшей строкой.
 enum class Kind : uint8_t {
     None,     ///< пустая строка — молча пропустить
@@ -29,6 +46,7 @@ enum class Kind : uint8_t {
     WifiOn,   ///< «wifi on» — включить радио и подключиться по сохранённым данным
     Api,      ///< «api <адрес>» — подменить адрес API, текст в out_text/out_len
     Tz,       ///< «tz <зона>» — сменить таймзону, текст в out_text/out_len
+    Screen,   ///< «screen <имя>» — открыть экран, имя в out_text/out_len
     Unknown,  ///< строка есть, но это не команда — сказать об этом
 };
 
@@ -43,6 +61,8 @@ enum class Kind : uint8_t {
 ///   `wifi on`      — включить радио и подключиться к сохранённой сети
 ///   `api <адрес>`  — подменить адрес API (проверка на фальшивом сервере)
 ///   `tz <зона>`    — сменить таймзону, формат POSIX: `tz YEKT-5`
+///   `screen <имя>` — открыть экран: `chat`, `threads`, `notes`, `wifi`,
+///                    `api`, `help`, `diag`, `about`
 ///
 /// Пробелы в начале и конце строки не считаются частью команды. Пробелы внутри
 /// вопроса сохраняются как есть: «ask  2 + 2» спросит «2 + 2», а не «2 + 2»
@@ -54,6 +74,13 @@ enum class Kind : uint8_t {
 /// @param out_len   длина вопроса
 /// @return что делать; для Kind::Ask в out_text/out_len лежит текст
 Kind parse(const char* line, size_t len, const char** out_text, size_t* out_len);
+
+/// Разобрать имя экрана из `screen <имя>`.
+///
+/// @param name  имя, уже выделенное parse()
+/// @param len   его длина
+/// @return экран или `Screen::None`, если имя незнакомое
+Screen parse_screen(const char* name, size_t len);
 
 /// Подсказка по командам — одна строка, чтобы не засорять лог.
 const char* help_text();

@@ -37,7 +37,6 @@ constexpr int kVisibleRows = 15;
 /// предыдущего экрана — на плате в ней висело поле ввода чата («Вопрос…»).
 constexpr int kFooterY = kListY + kVisibleRows * kRowH;
 constexpr int kErrorY = kFooterY + 34;
-constexpr int kHintsY = 694;
 
 /// Ширина полосы прокрутки. Три пикселя на экране 1280 — это почти невидимая
 /// нить, а ползунок по ней ещё и делится на части перерисовкой строк.
@@ -584,7 +583,7 @@ void ThreadsScreen::draw_footer()
 {
     // Вся полоса разом: подтверждение и ошибка лежат рядом, и чистить их по
     // отдельности значило бы затирать соседнюю строку чёрным прямоугольником.
-    M5.Display.fillRect(0, kFooterY, M5.Display.width(), kHintsY - 8 - kFooterY, TFT_BLACK);
+    M5.Display.fillRect(0, kFooterY, M5.Display.width(), ui::kHintY - 8 - kFooterY, TFT_BLACK);
 
     if (_armed >= 0) {
         char text[160];
@@ -603,9 +602,9 @@ void ThreadsScreen::draw_footer()
 
 void ThreadsScreen::draw_hints()
 {
-    M5.Display.fillRect(0, kHintsY - 8, M5.Display.width(), 34, TFT_BLACK);
-    ui::text(
-        "↑↓ — выбор · Enter — открыть · Ctrl+N — новый · Del — удалить · Esc — в чат", kMargin, kHintsY, kColorFaint);
+    M5.Display.fillRect(0, ui::kHintY - 8, M5.Display.width(), 34, TFT_BLACK);
+    ui::text("↑↓ — выбор · Enter — открыть · Ctrl+N — новый · Del — удалить · Esc — в чат", kMargin, ui::kHintY,
+        kColorFaint);
 }
 
 }  // namespace ui
