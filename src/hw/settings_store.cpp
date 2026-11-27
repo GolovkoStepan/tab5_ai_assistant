@@ -250,6 +250,32 @@ bool SettingsStore::set_layout_russian(bool russian, char* err, size_t err_len)
     return save_to_file(err, err_len);
 }
 
+bool SettingsStore::set_timezone(const char* tz, char* err, size_t err_len)
+{
+    if (err && err_len > 0) err[0] = '\0';
+
+    if (!settings::valid_timezone(tz)) {
+        if (err && err_len > 0) snprintf(err, err_len, "%s", "таймзона должна быть в формате POSIX: YEKT-5, MSK-3");
+        return false;
+    }
+    if (strlen(tz) >= sizeof(_config.timezone)) {
+        if (err && err_len > 0) snprintf(err, err_len, "%s", "таймзона длиннее 31 символа — не помещается");
+        return false;
+    }
+
+    // Сначала в память: если запись на карту не удастся, _config и файл не
+    // разойдутся — обе останутся в прежнем состоянии.
+    char before[sizeof(_config.timezone)];
+    memcpy(before, _config.timezone, sizeof(before));
+    snprintf(_config.timezone, sizeof(_config.timezone), "%s", tz);
+
+    if (!save_to_file(err, err_len)) {
+        memcpy(_config.timezone, before, sizeof(before));
+        return false;
+    }
+    return true;
+}
+
 bool SettingsStore::set_api_settings(const settings::Config& cfg, char* err, size_t err_len)
 {
     if (err && err_len > 0) err[0] = '\0';

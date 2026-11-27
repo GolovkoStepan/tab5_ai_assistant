@@ -9,6 +9,7 @@
 #include <M5Unified.h>
 
 #include <stddef.h>
+#include <stdio.h>
 
 #include "ui/draw.h"
 #include "version.h"
@@ -34,6 +35,12 @@ constexpr int kBarH = 4;
 constexpr int kStepsY = 372;
 constexpr int kStepRowH = 30;
 constexpr int kStepW = 420;
+
+/// Версия — в правом нижнем углу, мелко и серым. Место выбрано так, чтобы не
+/// спорить с содержимым: шаги и пояснение к ним занимают центр и низ до ~570,
+/// а угол остаётся пустым. Крупно её показывать незачем — на заставке она
+/// отвечает на вопрос «что за сборка?», а не служит заголовком.
+constexpr int kVersionMargin = 24;
 
 /// Крупный шрифт для названия. В efontJA_24 есть кириллица и цифры (проверено
 /// разбором таблицы глифов), поэтому латиница и русский заголовок набраны
@@ -130,7 +137,6 @@ void splash_begin(int screen_w, int screen_h)
 {
     const int w = screen_w;
     const int h = screen_h;
-    (void)h;
 
     M5.Display.fillScreen(TFT_BLACK);
 
@@ -138,6 +144,14 @@ void splash_begin(int screen_w, int screen_h)
     // заставка это витрина, а не рабочий экран.
     draw_center("TAB5", w / 2, kTitleY, kColorTitle, 4.0f, kBigFont);
     draw_center("карманный ИИ-помощник", w / 2, kSubtitleY, kColorDim, 1.0f);
+
+    // Версия в правом нижнем углу. Она нужна не для красоты: когда сборок
+    // много, «та ли прошивка на плате?» проверяется глазами за секунду, а не
+    // через Serial и `version`. Формат «v0.4.0» — с буквой, чтобы не путалось
+    // с числом на экране.
+    char version[24];
+    snprintf(version, sizeof(version), "v%s", APP_VERSION);
+    ui::text_right(version, w - kVersionMargin, h - kVersionMargin - 16, kColorFaint);
 
     draw_progress(w, 0);
 

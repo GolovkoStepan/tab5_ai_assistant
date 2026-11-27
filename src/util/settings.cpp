@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "util/iso_time.h"
+
 namespace settings {
 namespace {
 
@@ -421,6 +423,18 @@ void make_default_config(Config& out)
     out.battery_shutdown_percent = 5;
 }
 
+bool valid_timezone(const char* tz)
+{
+    if (tz == nullptr || tz[0] == '\0') return false;
+
+    // newlib на ESP32 не знает базы зон IANA: "Europe/Moscow" она молча
+    // превратит в UTC. Поэтому нужна форма POSIX: имя и смещение хвостом.
+    // Само смещение разбирает isotime::parse_tz_offset — он уже проверен
+    // тестами на «MSK-3», «UTC+5» и «MSK-3:30».
+    int minutes = 0;
+    return isotime::parse_tz_offset(tz, &minutes);
+}
+
 bool validate(const Config& cfg, char* err, size_t err_len)
 {
     if (err && err_len > 0) err[0] = '\0';
@@ -450,6 +464,7 @@ bool validate(const Config& cfg, char* err, size_t err_len)
     if (cfg.search_max_results > 10) return fail("search_max_results вне диапазона 0..10");
     if (cfg.screen_timeout_min > 60) return fail("timeout_min вне диапазона 0..60");
     if (cfg.timezone[0] == '\0') return fail("не задана таймзона");
+    if (!valid_timezone(cfg.timezone)) return fail("таймзона должна быть в формате POSIX: YEKT-5, MSK-3");
 
     // Пороги разряда должны идти по убыванию: иначе «критично» наступит раньше
     // «предупреждения», и предупреждение не покажется никогда.

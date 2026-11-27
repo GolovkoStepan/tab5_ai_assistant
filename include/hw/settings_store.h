@@ -50,6 +50,13 @@ public:
     /// @param err буфер для причины отказа
     bool set_layout_russian(bool russian, char* err, size_t err_len);
 
+    /// Записать таймзону в config.json.
+    ///
+    /// Отдельно от set_api_settings, хотя обе пишут один файл: таймзона нужна
+    /// раньше всего остального (метки в треде, часы в трее), а экран настроек
+    /// API её не редактирует. Проверка формы строки — settings::valid_timezone.
+    bool set_timezone(const char* tz, char* err, size_t err_len);
+
     /// Заменить настройки API (адрес, модель, температура, уровень
     /// рассуждений) и сохранить файл.
     ///

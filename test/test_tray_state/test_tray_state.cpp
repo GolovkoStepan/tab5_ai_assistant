@@ -322,6 +322,96 @@ void test_info_equality_zero_initialised()
     TEST_ASSERT_TRUE(a == b);
 }
 
+void test_clock_label_formats_like_example()
+{
+    char out[tray::kClockTextLen];
+    // Владелец просил именно такой вид: «Пт, 27 нояб. 13:59».
+    TEST_ASSERT_TRUE(tray::clock_label(5, 27, 11, 13, 59, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("Пт, 27 нояб. 13:59", out);
+}
+
+void test_clock_label_pads_time_but_not_day()
+{
+    char out[tray::kClockTextLen];
+    // Время с ведущим нулём — иначе «9:05» прыгало бы по ширине. День без
+    // нуля: «Пт, 7 нояб.» читается как дата, а «07» — как число в отчёте.
+    TEST_ASSERT_TRUE(tray::clock_label(1, 7, 1, 9, 5, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("Пн, 7 янв. 09:05", out);
+}
+
+void test_clock_label_all_weekdays()
+{
+    // struct tm: 0 — воскресенье. Перепутать здесь легко, а заметно только
+    // глазами на плате, поэтому все семь проверяются тестом.
+    static const char* const kExpected[7] = {"Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"};
+    for (int wd = 0; wd < 7; ++wd) {
+        char out[tray::kClockTextLen];
+        TEST_ASSERT_TRUE(tray::clock_label(wd, 15, 6, 12, 0, out, sizeof(out)));
+        char expected[tray::kClockTextLen];
+        snprintf(expected, sizeof(expected), "%s, 15 июня 12:00", kExpected[wd]);
+        TEST_ASSERT_EQUAL_STRING(expected, out);
+    }
+}
+
+void test_clock_label_month_names()
+{
+    static const char* const kExpected[12] = {
+        "янв.", "февр.", "мар.", "апр.", "мая", "июня", "июля", "авг.", "сент.", "окт.", "нояб.", "дек."};
+    for (int m = 1; m <= 12; ++m) {
+        char out[tray::kClockTextLen];
+        TEST_ASSERT_TRUE(tray::clock_label(5, 1, m, 0, 0, out, sizeof(out)));
+        char expected[tray::kClockTextLen];
+        snprintf(expected, sizeof(expected), "Пт, 1 %s 00:00", kExpected[m - 1]);
+        TEST_ASSERT_EQUAL_STRING(expected, out);
+    }
+}
+
+void test_clock_label_rejects_bad_fields()
+{
+    char out[tray::kClockTextLen];
+    // RTC без заряда отдаёт мусор: -1 и нули. Выдуманная дата в трее хуже
+    // пустого места, поэтому такие поля отбрасываются, а не прижимаются.
+    TEST_ASSERT_FALSE(tray::clock_label(-1, 27, 11, 13, 59, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("", out);
+    TEST_ASSERT_FALSE(tray::clock_label(7, 27, 11, 13, 59, out, sizeof(out)));
+    TEST_ASSERT_FALSE(tray::clock_label(5, 0, 11, 13, 59, out, sizeof(out)));
+    TEST_ASSERT_FALSE(tray::clock_label(5, 32, 11, 13, 59, out, sizeof(out)));
+    TEST_ASSERT_FALSE(tray::clock_label(5, 27, 0, 13, 59, out, sizeof(out)));
+    TEST_ASSERT_FALSE(tray::clock_label(5, 27, 13, 13, 59, out, sizeof(out)));
+    TEST_ASSERT_FALSE(tray::clock_label(5, 27, 11, 24, 59, out, sizeof(out)));
+    TEST_ASSERT_FALSE(tray::clock_label(5, 27, 11, 13, 60, out, sizeof(out)));
+}
+
+void test_clock_label_small_buffer_is_empty_not_truncated()
+{
+    char out[12];
+    TEST_ASSERT_FALSE(tray::clock_label(5, 27, 11, 13, 59, out, sizeof(out)));
+    // Обрезок «Пт, 27 ноя» читался бы как другой месяц. Пустая строка
+    // честнее.
+    TEST_ASSERT_EQUAL_STRING("", out);
+}
+
+void test_clock_label_worst_case_fits_slot()
+{
+    // Слот трея рассчитан по худшему случаю: двузначный день и самое длинное
+    // сокращение месяца. Если это не влезет, часы наедут на значок Wi-Fi.
+    char out[tray::kClockTextLen];
+    TEST_ASSERT_TRUE(tray::clock_label(4, 28, 9, 23, 59, out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("Чт, 28 сент. 23:59", out);
+}
+
+void test_info_equality_sees_clock_change()
+{
+    tray::Info a;
+    tray::Info b;
+    TEST_ASSERT_TRUE(a == b);
+
+    // Минута сменилась — трей обязан перерисоваться. Без clock_text в
+    // сравнении часы замирали бы на первой показанной минуте.
+    snprintf(b.clock_text, sizeof(b.clock_text), "%s", "Пт, 27 нояб. 13:59");
+    TEST_ASSERT_TRUE(a != b);
+}
+
 int main(int, char**)
 {
     UNITY_BEGIN();
@@ -365,5 +455,14 @@ int main(int, char**)
 
     RUN_TEST(test_info_equality_ignores_nothing);
     RUN_TEST(test_info_equality_zero_initialised);
+
+    RUN_TEST(test_clock_label_formats_like_example);
+    RUN_TEST(test_clock_label_pads_time_but_not_day);
+    RUN_TEST(test_clock_label_all_weekdays);
+    RUN_TEST(test_clock_label_month_names);
+    RUN_TEST(test_clock_label_rejects_bad_fields);
+    RUN_TEST(test_clock_label_small_buffer_is_empty_not_truncated);
+    RUN_TEST(test_clock_label_worst_case_fits_slot);
+    RUN_TEST(test_info_equality_sees_clock_change);
     return UNITY_END();
 }

@@ -17,6 +17,7 @@
 #include <SD_MMC.h>
 #include <stdarg.h>
 #include <string.h>
+#include <time.h>
 
 #include "app_config.h"
 #include "hw/api_client.h"
@@ -512,9 +513,11 @@ void drawAll()
     drawText(g_status, kMargin, kStatusY, TFT_CYAN);
 
     // Заголовок и тестовая строка кириллицы: строчные, заглавные, Ё,
-    // типографские кавычки, знак номера.
+    // типографские кавычки, знак номера. Сдвинута на 600, а не на 620: трей с
+    // часами начинается с 952 px, и прежнее место кончалось на 948 — зазор
+    // был в четыре пикселя.
     drawText("TAB5 AI Assistant " APP_VERSION, kMargin, kTitleY, TFT_WHITE);
-    drawText("Съешь же ещё этих мягких булок — «Ёж» №5…", 620, kTitleY + 4, TFT_LIGHTGRAY);
+    drawText("Съешь же ещё этих мягких булок — «Ёж» №5…", 600, kTitleY + 4, TFT_LIGHTGRAY);
 
     drawGrid();
     drawLast();
@@ -528,7 +531,8 @@ void drawAll()
 
     // Трей и здесь: экран диагностики — тоже экран устройства, а заряд и сеть
     // нужны на нём не меньше. Тестовая строка кириллицы кончается на 948 px,
-    // трей начинается с 1004 — они не пересекаются.
+    // трей начинается с 952 — они не пересекаются, но запас в 4 px тонкий:
+    // если строка подрастёт, её надо будет укоротить или сдвинуть влево.
     ui::draw_tray(M5.Display.width());
 }
 
@@ -684,6 +688,19 @@ tray::Info build_tray_info()
     info.battery_known = charge == tray::Charge::Discharging && g_power.level >= 0;
     info.battery_percent = g_power.level;
     tray::battery_label(charge, info.battery_known, info.battery_percent, info.battery_text, sizeof(info.battery_text));
+
+    // Часы. Берём системное время, а не RTC: на незаряженном суперконденсаторе
+    // RTC отдаёт мусор, а системные часы выставляет clock_sync (NTP или RTC при
+    // старте). Пока время не осмысленное, поле остаётся пустым — «01 янв.
+    // 00:00» в трее выглядело бы как сломанные часы, а пустое место честно
+    // говорит «времени ещё нет».
+    if (hw::clock_sync::valid()) {
+        const time_t now = time(nullptr);
+        struct tm t{};
+        localtime_r(&now, &t);
+        tray::clock_label(
+            t.tm_wday, t.tm_mday, t.tm_mon + 1, t.tm_hour, t.tm_min, info.clock_text, sizeof(info.clock_text));
+    }
 
     return info;
 }
@@ -1038,6 +1055,31 @@ void poll_serial_command()
                     // отправке, так что пересборка не нужна: следующий вопрос
                     // уже пойдёт на новый адрес.
                     Serial.println("Serial: адрес API изменён и сохранён в config.json");
+                    break;
+                }
+                case serialcmd::Kind::Tz: {
+                    // Смена таймзоны на месте: «я в Уфе, а часы по Москве» —
+                    // обычная жалоба, и вынимать карту ради одной строки в
+                    // config.json незачем.
+                    char tz[settings::kMaxTimezone];
+                    if (text_len >= sizeof(tz)) {
+                        Serial.println("Serial: таймзона длиннее 31 символа — не помещается");
+                        break;
+                    }
+                    memcpy(tz, text, text_len);
+                    tz[text_len] = '\0';
+
+                    char err[128];
+                    if (!g_settings.set_timezone(tz, err, sizeof(err))) {
+                        Serial.printf("Serial: таймзона не принята — %s\n", err);
+                        break;
+                    }
+                    // TZ применяется сразу: часы в трее и метки в треде начнут
+                    // считаться по новому поясу без перезагрузки. NTP уже сверен,
+                    // системные часы хранят UTC — пересчёт делает localtime_r.
+                    hw::clock_sync::begin(g_settings.config());
+                    Serial.printf("Serial: таймзона %s сохранена и применена\n", tz);
+                    update_tray();
                     break;
                 }
                 case serialcmd::Kind::Unknown: Serial.println(serialcmd::help_text()); break;

@@ -109,6 +109,19 @@ Kind parse(const char* line, size_t len, const char** out_text, size_t* out_len)
         return Kind::Api;
     }
 
+    // `tz <зона>` — таймзона. Живёт рядом с `api`: и то, и другое правит
+    // config.json, а набирать «YEKT-5» кареткой на устройстве неудобно и не
+    // повторяется скриптом. Без аргумента — подсказка, как у `api`.
+    if (starts_with_ci(s, n, "tz") && (n == 2 || is_space(s[2]))) {
+        size_t start = 2;
+        while (start < n && is_space(s[start]))
+            ++start;
+        if (start >= n) return Kind::Help;
+        if (out_text != nullptr) *out_text = s + start;
+        if (out_len != nullptr) *out_len = n - start;
+        return Kind::Tz;
+    }
+
     // `ask <текст>` и `> <текст>`.
     size_t start = 0;
     const bool is_ask = starts_with_ci(s, n, "ask") && (n == 3 || is_space(s[3]));
@@ -140,6 +153,7 @@ const char* help_text()
     return "Serial: \"ask <вопрос>\" или \"> <вопрос>\" — отправить в чат; "
            "\"thread\" — распечатать тред; \"wifi off\"/\"wifi on\" — выключить и включить сеть; "
            "\"api <адрес>\" — подменить адрес API (проверка на своём сервере); "
+           "\"tz <зона>\" — сменить таймзону, формат POSIX: \"tz YEKT-5\"; "
            "\"help\" — эта подсказка";
 }
 

@@ -302,6 +302,40 @@ void test_validate_rejects_bad_power_thresholds()
     TEST_ASSERT_TRUE(strstr(err, "убывать") != nullptr);
 }
 
+/// Форма POSIX нужна потому, что newlib на ESP32 не знает базы зон IANA:
+/// «Europe/Moscow» она молча превратит в UTC, и часы уедут на три часа.
+/// Проверить это глазами на плате трудно — поэтому тестом.
+void test_valid_timezone_posix()
+{
+    TEST_ASSERT_TRUE(settings::valid_timezone("YEKT-5"));
+    TEST_ASSERT_TRUE(settings::valid_timezone("MSK-3"));
+    TEST_ASSERT_TRUE(settings::valid_timezone("UTC-0"));
+    TEST_ASSERT_TRUE(settings::valid_timezone("IST-5:30"));
+    // Знак POSIX обратный: «UTC+5» — это UTC−5, и это законная запись.
+    TEST_ASSERT_TRUE(settings::valid_timezone("UTC+5"));
+}
+
+void test_valid_timezone_rejects_iana_names()
+{
+    TEST_ASSERT_FALSE(settings::valid_timezone("Europe/Moscow"));
+    TEST_ASSERT_FALSE(settings::valid_timezone("Asia/Yekaterinburg"));
+    TEST_ASSERT_FALSE(settings::valid_timezone(""));
+    TEST_ASSERT_FALSE(settings::valid_timezone(nullptr));
+    // Смещение вне ±14 часов — опечатка, а не пояс.
+    TEST_ASSERT_FALSE(settings::valid_timezone("XXX-15"));
+}
+
+void test_validate_rejects_iana_timezone()
+{
+    settings::Config cfg;
+    settings::make_default_config(cfg);
+    copy_str(cfg.timezone, sizeof(cfg.timezone), "Asia/Yekaterinburg");
+
+    char err[128];
+    TEST_ASSERT_FALSE(settings::validate(cfg, err, sizeof(err)));
+    TEST_ASSERT_TRUE(strstr(err, "POSIX") != nullptr);
+}
+
 void test_truncated_utf8_stops_on_char_boundary()
 {
     // Значение длиннее буфера: обрезка не должна разрезать кириллицу пополам —
@@ -466,6 +500,9 @@ int main(int, char**)
     RUN_TEST(test_parse_flat_keys_still_work);
     RUN_TEST(test_parse_unknown_section_key_is_skipped);
     RUN_TEST(test_validate_rejects_bad_power_thresholds);
+    RUN_TEST(test_valid_timezone_posix);
+    RUN_TEST(test_valid_timezone_rejects_iana_names);
+    RUN_TEST(test_validate_rejects_iana_timezone);
     RUN_TEST(test_truncated_utf8_stops_on_char_boundary);
 
     RUN_TEST(test_write_config_roundtrip);

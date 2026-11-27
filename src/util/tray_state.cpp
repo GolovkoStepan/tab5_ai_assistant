@@ -18,7 +18,8 @@ bool Info::operator==(const Info& o) const
 {
     return wifi_connected == o.wifi_connected && wifi_connecting == o.wifi_connecting && wifi_level == o.wifi_level &&
            charge == o.charge && battery_known == o.battery_known && battery_percent == o.battery_percent &&
-           strcmp(wifi_text, o.wifi_text) == 0 && strcmp(battery_text, o.battery_text) == 0;
+           strcmp(wifi_text, o.wifi_text) == 0 && strcmp(battery_text, o.battery_text) == 0 &&
+           strcmp(clock_text, o.clock_text) == 0;
 }
 
 void wifi_label(bool connected, bool connecting, char* out, size_t out_len)
@@ -119,6 +120,37 @@ uint8_t wifi_level(bool connected, int rssi)
     // именно тогда, когда сеть пропала.
     if (!connected) return 0;
     return wifi::signal_level(rssi);
+}
+
+bool clock_label(int weekday, int day, int month, int hour, int minute, char* out, size_t out_len)
+{
+    if (out == nullptr || out_len == 0) return false;
+    out[0] = '\0';
+
+    // Порядок как в struct tm: 0 — воскресенье. В русском «Пн» — первый день,
+    // но переставлять здесь нечего: индекс в таблицу берётся прямой.
+    static const char* const kWeekdays[7] = {"Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"};
+    // Сокращения в родительном падеже — так они читаются рядом с числом
+    // («27 нояб.»). Короткие месяцы не режем: «мая» и «июня» уже короче
+    // любого сокращения.
+    static const char* const kMonths[12] = {
+        "янв.", "февр.", "мар.", "апр.", "мая", "июня", "июля", "авг.", "сент.", "окт.", "нояб.", "дек."};
+
+    if (weekday < 0 || weekday > 6) return false;
+    if (day < 1 || day > 31) return false;
+    if (month < 1 || month > 12) return false;
+    if (hour < 0 || hour > 23) return false;
+    if (minute < 0 || minute > 59) return false;
+
+    const int n =
+        snprintf(out, out_len, "%s, %d %s %02d:%02d", kWeekdays[weekday], day, kMonths[month - 1], hour, minute);
+    if (n < 0 || static_cast<size_t>(n) >= out_len) {
+        // Не влезло — пустая строка, а не обрезанная посреди слова дата:
+        // «Пт, 27 ноя» читается как другой месяц.
+        out[0] = '\0';
+        return false;
+    }
+    return true;
 }
 
 bool battery_low(bool known, int percent)

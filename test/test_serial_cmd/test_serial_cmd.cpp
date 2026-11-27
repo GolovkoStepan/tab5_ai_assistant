@@ -215,6 +215,55 @@ void test_api_prefix_is_not_api()
     parse_text("apikey", out, sizeof(out), serialcmd::Kind::Unknown);
 }
 
+/// `tz <зона>` — смена таймзоны рядом с `api`: обе правят config.json.
+void test_tz_zone()
+{
+    auto parse_tz = [](const char* line, char* out, size_t out_len) {
+        const char* text = nullptr;
+        size_t text_len = 0;
+        const serialcmd::Kind kind = serialcmd::parse(line, strlen(line), &text, &text_len);
+        TEST_ASSERT_EQUAL(static_cast<int>(serialcmd::Kind::Tz), static_cast<int>(kind));
+        const size_t n = text_len < out_len - 1 ? text_len : out_len - 1;
+        memcpy(out, text, n);
+        out[n] = '\0';
+    };
+
+    char out[32];
+    parse_tz("tz YEKT-5", out, sizeof(out));
+    TEST_ASSERT_EQUAL_STRING("YEKT-5", out);
+
+    // Регистр команды — любой, значение сохраняется как написано.
+    parse_tz("TZ MSK-3", out, sizeof(out));
+    TEST_ASSERT_EQUAL_STRING("MSK-3", out);
+
+    // Дробное смещение: в Индии и Непале пояс не кратен часу.
+    parse_tz("tz IST-5:30", out, sizeof(out));
+    TEST_ASSERT_EQUAL_STRING("IST-5:30", out);
+}
+
+/// `tz` без аргумента — подсказка: молчаливое «понял» оставило бы старый пояс.
+void test_tz_without_argument_is_help()
+{
+    char out[8];
+    parse_text("tz", out, sizeof(out), serialcmd::Kind::Help);
+    parse_text("tz   ", out, sizeof(out), serialcmd::Kind::Help);
+}
+
+/// Слово, начинающееся с «tz», но не команда (`tzdata`, `tzset`).
+void test_tz_prefix_is_not_tz()
+{
+    char out[8];
+    parse_text("tzdata", out, sizeof(out), serialcmd::Kind::Unknown);
+    parse_text("tzset", out, sizeof(out), serialcmd::Kind::Unknown);
+}
+
+/// Подсказка должна упоминать `tz`: иначе о команде никто не узнает.
+void test_help_mentions_tz()
+{
+    const char* text = serialcmd::help_text();
+    TEST_ASSERT_NOT_NULL(strstr(text, "tz"));
+}
+
 /// Слово, начинающееся с «ask», но без пробела — не команда.
 void test_ask_prefix_is_not_ask()
 {
@@ -275,6 +324,10 @@ int main(int, char**)
     RUN_TEST(test_api_address);
     RUN_TEST(test_api_without_address_is_help);
     RUN_TEST(test_api_prefix_is_not_api);
+    RUN_TEST(test_tz_zone);
+    RUN_TEST(test_tz_without_argument_is_help);
+    RUN_TEST(test_tz_prefix_is_not_tz);
+    RUN_TEST(test_help_mentions_tz);
     RUN_TEST(test_ask_prefix_is_not_ask);
     RUN_TEST(test_null_line);
     RUN_TEST(test_cyrillic_whole_question);
