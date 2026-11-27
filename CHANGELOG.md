@@ -5,6 +5,14 @@
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-11-27
+
+Этап «Настройки и быт»: закрыты четыре дыры, найденные чтением кода сразу после
+v1.0.0. Ни одна из них не была в плане — их не нашли ни приёмкой, ни тестами,
+потому что каждая тихая: настройку можно было поменять только с компьютера,
+повтор вопроса набирался заново, заметку мог создать только агент, а остаток
+списка за шестидесятым документом просто не существовал.
+
 ### Добавлено
 
 - **Экран «Параметры» — `Ctrl+G`** («п» в ЙЦУКЕН). Яркость, таймаут подсветки,
@@ -1122,7 +1130,8 @@ SD-карте, а у человека появляется экран архив
 - Юнит-тесты на хосте: 78 тестов (форматирование, раскладка, настройки, список
   сетей), `./scripts/check.sh docker` зелёный.
 
-[Unreleased]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/GolovkoStepan/tab5_ai_assistant/compare/v0.3.1...v0.4.0
